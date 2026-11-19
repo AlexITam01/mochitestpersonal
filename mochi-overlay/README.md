@@ -11,18 +11,33 @@ Package: `com.alex.mochidownload` · App name: "Mochi Download" · minSdk 26.
 
 1. **Runs concurrently with Mochi.** A foreground service + overlay window,
    alive while Mochi is in the foreground. The button is only drawn over
-   Mochi — nowhere else.
+   Mochi — nowhere else. Foreground is detected with UsageStats *events*
+   (MOVE_TO_FOREGROUND / MOVE_TO_BACKGROUND) plus the AccessibilityService's
+   window-state signal — **not** with `lastTimeUsed`, which goes stale
+   within seconds while an app is still in front and used to make the
+   button vanish ~3s after Mochi opened. The button is only removed when a
+   different app is *positively* known to be in front; "unknown" leaves it
+   alone, and it is never removed while Alex is positioning it.
 2. **Long-press to position.** Long-press the button (~0.5s) to enter
    positioning mode (it gets a dashed white outline), drag it where it
    should go, and **on release the position is recorded and persisted**
    (SharedPreferences). No separate save step. Tap the button in positioning
-   mode to lock it without moving.
+   mode to lock it without moving. A long-press can no longer make the
+   button disappear: the visibility poll never removes the button while it
+   is being positioned, and the foreground check no longer goes stale.
+   The button is 51dp across (~80% of the original 64dp — scaled down
+   ~20% at Alex's request).
 3. **Closes with Mochi, reopens at the same spot.** When Mochi closes, the
    overlay window is removed. When Mochi opens again, the button reopens
    automatically at that same recorded position — back on the same spot
    where it was left. The service keeps a lightweight watch (UsageStats
    poll) so it can re-show the button, and the AccessibilityService also
    nudges the service awake when Mochi comes to the foreground.
+   **A position Alex sets by dragging is authoritative**: once he has
+   placed the button, it always comes back to that exact spot. The
+   action-column anchor is only used for the first-run placement (before
+   he has ever positioned the button) — it never drags the button away
+   from a spot he chose.
 4. **Alex drives Mochi himself.** The overlay never taps, swipes, scrolls,
    or navigates Mochi for him. He taps/swipes/scrolls to the video he
    wants; the button just sits there waiting.
@@ -40,10 +55,13 @@ button, centred on it, so it reads as a native fourth action button.
 
 - It **tracks** the anchor: if Mochi's layout shifts (e.g. scrolling to the
   next video), the button re-anchors to the new position of the action
-  column.
-- **Long-press + drag sets Alex's preferred offset** from the anchor. That
-  offset is saved, so the button keeps the same relationship to the action
-  column even when the column moves.
+  column. **This tracking only applies before Alex has ever positioned the
+  button himself.** Once he long-press + drags it, his saved spot wins and
+  the anchor stops moving the button — that is the fix for the button not
+  remembering where he put it.
+- **Long-press + drag sets Alex's preferred position.** That absolute spot
+  is saved and always restored, so the button keeps the same place even
+  when the action column moves.
 - If no action column is visible on a screen, the button falls back to its
   recorded absolute position (free-floating) until an anchor appears again.
 
@@ -143,6 +161,39 @@ Install the APK, open "Mochi Download", grant the three items, tap
 "Start overlay", then open Mochi. The button appears over Mochi (latched
 under the action column). Long-press it to move it; release to lock the
 spot. Tap it to download the video showing.
+
+**If the button disappears or won't stay put, check Usage access first:**
+Settings → Apps → Mochi Download → Usage access (or Settings → Privacy →
+Permission manager → Usage access) must show Mochi Download as allowed.
+Without it the app cannot tell Mochi is in the foreground. The app's own
+status screen also shows "Usage access: granted / NOT granted" — confirm
+it says granted before reporting a bug.
+
+## Fixes (2026-11-19) — first test round
+
+Alex tested v1.0 and reported: the button vanished ~3s after Mochi opened;
+long-pressing made it disappear; it did not remember its position; and it
+was ~20% oversized. Root causes and fixes, all in `OverlayService.kt`:
+
+- **Vanishes in ~3s:** foreground was detected with
+  `queryUsageStats()` + `lastTimeUsed < 3000ms`. `lastTimeUsed` is only
+  refreshed when an app's usage session is recorded, so it goes stale
+  within seconds while the app is still in front — the poll then concluded
+  Mochi was gone and removed the button. Fixed by switching to UsageStats
+  *events* (`queryEvents`, MOVE_TO_FOREGROUND / MOVE_TO_BACKGROUND), which
+  report the actual transitions and stay correct indefinitely, plus using
+  the AccessibilityService's window-state signal as a second source.
+- **Long-press disappears:** the same stale poll removed the button while
+  Alex was holding it. Fixed: the poll never removes the button on
+  "unknown" foreground and never removes it while positioning (edit mode).
+- **Position not remembered:** two causes — the 3s bug removed the button
+  before release, so the position was never saved; and even when saved,
+  the anchor + offset took priority over the saved absolute spot, so the
+  button snapped back to the anchor. Fixed: a dragged position is now
+  authoritative (restored first, anchor tracking disabled once one is
+  saved); the anchor is only the first-run placement.
+- **Oversized ~20%:** button reduced from 64dp to 51dp (~80% of the
+  original size).
 
 ## What this is NOT
 

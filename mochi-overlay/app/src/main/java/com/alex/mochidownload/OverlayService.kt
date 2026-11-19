@@ -74,7 +74,7 @@ class OverlayService : Service() {
         private const val LONG_PRESS_MS = 500L
         private const val MOVE_TOLERANCE_PX = 12f
         private const val POLL_MS = 1000L
-        private const val BUTTON_SIZE_DP = 64
+        private const val BUTTON_SIZE_DP = 51
         private const val ANCHOR_GAP_DP = 12
         private const val REPOSITION_TOLERANCE_PX = 4
     }
@@ -151,25 +151,42 @@ class OverlayService : Service() {
 
     /** Show the button only while Mochi is foreground; re-anchor it when
      *  Mochi's layout shifts. The button is REMOVED (overlay closes) when
-     *  Mochi is not foreground, and re-added at the recorded position when
-     *  Mochi comes back. */
+     *  another app is positively known to be foreground, and re-added at
+     *  the recorded position when Mochi comes back.
+     *
+     * Two rules that fix the "vanishes in ~3s" bug:
+     *  - Never remove the button on "unknown" (null foreground). The old
+     *    code treated "cannot confirm Mochi" as "Mochi is gone", and the
+     *    UsageStats staleness made that fire within seconds of Mochi
+     *    opening.
+     *  - Never remove the button while Alex is positioning it (edit mode).
+     *    A long-press must not be interrupted by the poll. */
     private fun updateVisibilityAndAnchor() {
         val foreground = currentForegroundPackage()
-        if (foreground == MOCHI_PACKAGE) {
+        val mochiForeground =
+            foreground == MOCHI_PACKAGE || MochiState.isMochiForeground
+        if (mochiForeground) {
             if (!buttonVisible) {
                 showButton()
             } else if (!editMode) {
                 trackAnchor()
             }
-        } else {
-            if (buttonVisible) removeButton()
+        } else if (foreground != null && foreground != MOCHI_PACKAGE) {
+            // Positive evidence a different app is in front.
+            if (buttonVisible && !editMode) removeButton()
         }
+        // foreground == null (unknown) and the accessibility service does
+        // not say Mochi is front: leave the button exactly as it is.
     }
 
     /** If the anchor moved since we last positioned the button, move the
-     *  button with it (suckerfish). Only when not being dragged by Alex. */
+     *  button with it (suckerfish). Only when not being dragged by Alex,
+     *  and only while Alex has never placed the button himself — once he
+     *  long-press + drags it, his saved spot is authoritative and the
+     *  anchor must not pull the button away from it. */
     private fun trackAnchor() {
         val lp = params ?: return
+        if (prefs.getInt(KEY_X, -1) >= 0 && prefs.getInt(KEY_Y, -1) >= 0) return
         if (!MochiState.hasAnchor()) return
         val anchorMoved =
             MochiState.anchorLeft != lastAnchorL ||
@@ -191,36 +208,61 @@ class OverlayService : Service() {
         lastAnchorB = MochiState.anchorBottom
     }
 
-    /** Best-effort foreground package via UsageStats. Returns null if the
-     *  "Usage access" permission has not been granted. */
+    /** Best-effort foreground package via UsageStats *events*.
+     * Returns null if the "Usage access" permission has not been granted,
+     * or if no foreground change is visible in the window (unknown).
+     *
+     * NOTE: the previous implementation used queryUsageStats() +
+     * lastTimeUsed, which is wrong for a foreground app — lastTimeUsed is
+     * only refreshed when the app's usage session is recorded, so it goes
+     * stale within seconds while the app is still in front. That made the
+     * button vanish ~3s after Mochi opened. Events (MOVE_TO_FOREGROUND /
+     * MOVE_TO_BACKGROUND) report the actual transitions, so they stay
+     * correct no matter how long Mochi has been open. */
     private fun currentForegroundPackage(): String? {
         val usm = getSystemService(USAGE_STATS_SERVICE) as? UsageStatsManager
             ?: return null
         val now = System.currentTimeMillis()
-        val stats = usm.queryUsageStats(
-            UsageStatsManager.INTERVAL_BEST, now - 5000, now
-        ) ?: return null
-        var latest: android.app.usage.UsageStats? = null
-        for (s in stats) {
-            if (latest == null || s.lastTimeUsed > latest.lastTimeUsed) latest = s
+        val events = try {
+            usm.queryEvents(now - 3600000L, now)
+        } catch (e: Exception) {
+            return null
+        } ?: return null
+        val event = android.app.usage.UsageEvents.Event()
+        var foreground: String? = null
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event)
+            when (event.eventType) {
+                android.app.usage.UsageEvents.Event.MOVE_TO_FOREGROUND ->
+                    foreground = event.packageName
+                android.app.usage.UsageEvents.Event.MOVE_TO_BACKGROUND -> {
+                    if (foreground == event.packageName) foreground = null
+                }
+            }
         }
-        if (latest != null && now - latest.lastTimeUsed < 3000) {
-            return latest.packageName
-        }
-        return null
+        return foreground
     }
 
     // ----- positioning -----
 
     /**
-     * Where the button should sit.
-     * If Mochi's action-column anchor is visible, the button latches onto
-     * it: centred under the bottom-most action button, plus Alex's saved
-     * offset from that anchor (set by long-press + drag). If no anchor is
-     * visible, it uses the recorded absolute position (free-floating).
-     * Returns (x, y) for the button's top-left corner.
+     * Where the button should sit. Returns (x, y) for the button's
+     * top-left corner.
+     *
+     * Priority (this is the fix for "doesn't remember the position"):
+     *  1. Alex's saved absolute position, if he has ever placed the button
+     *     by long-press + drag. A manual position is authoritative — the
+     *     anchor must not drag the button away from where he put it.
+     *  2. If no manual position exists yet and Mochi's action-column
+     *     anchor is visible, latch onto it (suckerfish): centred under the
+     *     bottom-most action button, plus the saved offset from that
+     *     anchor. This is only the first-run / never-positioned placement.
+     *  3. Otherwise the default: right side, middle of the screen.
      */
     private fun computeButtonPosition(): Pair<Int, Int> {
+        val startX = prefs.getInt(KEY_X, -1)
+        val startY = prefs.getInt(KEY_Y, -1)
+        if (startX >= 0 && startY >= 0) return Pair(startX, startY)
         if (MochiState.hasAnchor()) {
             val gapPx = (ANCHOR_GAP_DP * resources.displayMetrics.density).toInt()
             val offX = if (prefs.getBoolean(KEY_HAS_OFF, false)) {
@@ -233,9 +275,6 @@ class OverlayService : Service() {
             val y = MochiState.anchorBottomY() + offY
             return Pair(x, y)
         }
-        val startX = prefs.getInt(KEY_X, -1)
-        val startY = prefs.getInt(KEY_Y, -1)
-        if (startX >= 0 && startY >= 0) return Pair(startX, startY)
         val dm = resources.displayMetrics
         return Pair(dm.widthPixels - buttonSizePx - 32, dm.heightPixels / 2)
     }
