@@ -28,11 +28,12 @@ import java.net.URL
  * the video that is on screen RIGHT NOW and saves it as one .mp4 in
  * Downloads/Mochi/.
  *
- * Resolution order (first hit wins). The first three need no tapping
- * inside Mochi at all — they identify the playing video from what the
- * AccessibilityService can already see (title / creator / episode
- * number) and resolve it through Mochi's public read API (MochiApi,
- * no login). The Share flow is only the fallback.
+ * Resolution order (first hit wins). Steps 1, 4 and 5 need no tapping
+ * inside Mochi at all and no title — they identify the playing video
+ * from what the AccessibilityService can already see (a playback URL,
+ * an episode id, or a watch link) and resolve it through Mochi's
+ * public read API (MochiApi, no login). Steps 2 and 3 need the
+ * on-screen title. The Share flow is only the fallback.
  *
  *  1. A signed playback URL already visible on screen
  *     (MochiState.currentPlaybackUrl) — rare.
@@ -43,10 +44,16 @@ import java.net.URL
  *     series slug, and resolve (slug, episode number) to an episode
  *     id, then /play for the signed playbackUrl. Needs the episode
  *     number from the UI; skipped when it is not shown.
- *  4. An episode id already on screen -> /play -> playbackUrl.
+ *  4. An episode id already on screen -> /play -> playbackUrl. Runs
+ *     before steps 2/3: it needs no title and identifies the episode
+ *     exactly.
  *  5. A mochi.tv/watch link already on screen
  *     (mochi.tv/watch/<seriesSlug>/<episodeNumber>) -> lookup ->
- *     /play -> playbackUrl.
+ *     /play -> playbackUrl. Also runs before steps 2/3, for the same
+ *     reason. The full two-segment link is required: a slug-only link
+ *     cannot name an episode (treating the slug as an episode id
+ *     makes /play 404 — that was the "watch_page_no_stream" failure,
+ *     fixed in v7).
  *  6. Share flow (the fallback): tap Mochi's Share button, use Mochi's
  *     own "Download video" if offered, otherwise "Copy link" and
  *     resolve the watch link through the API (same as step 5).
@@ -224,6 +231,32 @@ object VideoDownloader {
                 fileNameFor(null, null, MochiState.currentTitle)
             )
         }
+        val episodeNumber = MochiState.currentEpisodeNumber
+
+        // 4. An episode id already on screen -> /play -> playbackUrl.
+        // 5. A mochi.tv/watch link already on screen -> lookup -> /play.
+        // These run before the title-based steps (2, 3) because they
+        // need no title: the id / link identifies the episode exactly,
+        // and the title heuristic is the fragile part. They only fire
+        // when the id / link is actually visible on screen right now
+        // (MochiState clears them when the video changes).
+        MochiState.currentPlaybackId?.takeIf { it.isNotBlank() }?.let { episodeId ->
+            MochiApi.fetchPlaybackUrl(episodeId)?.let { url ->
+                return ResolveResult.Found(
+                    url, "on-screen episode id",
+                    fileNameFor(null, episodeNumber, MochiState.currentTitle)
+                )
+            }
+        }
+        MochiState.currentWatchLink?.takeIf { it.isNotBlank() }?.let { watchLink ->
+            playbackUrlForWatchLink(watchLink)?.let { url ->
+                return ResolveResult.Found(
+                    url, "on-screen watch link",
+                    fileNameFor(null, episodeNumber, MochiState.currentTitle)
+                )
+            }
+        }
+
         val title = MochiState.currentTitle?.trim().takeIf { !it.isNullOrEmpty() }
             ?: return ResolveResult.Failed(
                 "no_title",
@@ -232,7 +265,6 @@ object VideoDownloader {
                     "playing in Mochi (not a menu) and tap again."
             )
         val creator = MochiState.currentCreator
-        val episodeNumber = MochiState.currentEpisodeNumber
 
         // 2. For You feed match.
         val feed = MochiApi.fetchForYouFeed()
@@ -322,7 +354,16 @@ object VideoDownloader {
         }
         // mochi.tv/watch/<episodeId> (bare id form).
         WATCH_LINK_ONE_PART.find(watchLink)?.let {
-            return MochiApi.fetchPlaybackUrl(it.groupValues[1])
+            val id = it.groupValues[1]
+            // First try it as an episode id.
+            MochiApi.fetchPlaybackUrl(id)?.let { url -> return url }
+            // If /play 404s, the single segment was a series slug, not
+            // an episode id (a slug-only watch link cannot name an
+            // episode by itself). Resolve it with the episode number
+            // currently on screen, if the player is showing one.
+            val ep = MochiState.currentEpisodeNumber ?: return null
+            val episodeId = MochiApi.lookupEpisode(id, ep) ?: return null
+            return MochiApi.fetchPlaybackUrl(episodeId)
         }
         return null
     }
@@ -761,18 +802,15 @@ object VideoDownloader {
     /** Report a failure plainly: toast (short) + notification (exact step).
      *  Also ends the download state: the ongoing notification is cleared
      *  and the button goes back from light blue to its normal look.
-     *  For resolution failures (the video could not be identified) the
-     *  notification also says what the app actually saw on screen, so a
-     *  wrong or stale title is visible instead of a bare code. */
+     *  EVERY failure notification also says what the app actually saw on
+     *  screen (title / creator / episode), so a wrong or stale capture
+     *  is visible instead of a bare code. This used to be limited to the
+     *  API resolution codes, which meant Share-flow failures like
+     *  "watch_page_no_stream" arrived with no diagnostic at all — Alex
+     *  saw the code and "nothing afterwards". Now all of them carry it. */
     private fun fail(context: Context, code: String, message: String) {
         finishDownload(context)
-        val resolutionCodes = setOf(
-            "no_title", "feed_no_match", "feed_ambiguous",
-            "episode_number_unknown", "lookup_failed", "play_failed", "api_failed"
-        )
-        val fullMessage = if (code in resolutionCodes) {
-            "$message\n\n${seenSummary()}"
-        } else message
+        val fullMessage = "$message\n\n${seenSummary()}"
         showStatus(context, "Mochi Download — could not download [$code]", fullMessage)
         toast(context, "Download failed: $code — see notification for details")
     }

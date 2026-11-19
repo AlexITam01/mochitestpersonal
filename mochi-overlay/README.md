@@ -506,6 +506,52 @@ unchanged. If a download still fails, the notification now says both
 the step code and what the app thought was playing — that is the
 diagnostic to report back.
 
+## Fixes (2026-11-19) — `watch_page_no_stream` (v7)
+
+Alex reported the exact failure sequence: tap → "Opening Mochi's Share
+menu to get the video link…" → "Download failed: watch_page_no_stream"
+→ nothing afterwards. The tap fell through all the API resolution
+paths to the Share flow, and the Share flow's watch-link resolution
+failed. The video source did **not** change (re-verified live: the
+public API and the signed HLS stream are unchanged, and Mochi 1.1.11
+is still the current version per its own `/version` endpoint).
+
+Root cause — a regex that dropped the episode number. The
+AccessibilityService's `WATCH_LINK` regex only captured the first
+path segment after `/watch/`, so a visible link like
+`mochi.tv/watch/god-slayer/1` was rebuilt as the slug-only
+`https://www.mochi.tv/watch/god-slayer`. The downloader then treated
+that slug as an episode id and called `/play` with it, which 404s
+("Episode not found") — verified live. That is exactly what produced
+`watch_page_no_stream`. The same one-segment capture was used in all
+three places a watch link is read (the share-sheet scan, the
+clipboard-fallback scan, and the normal UI scan that fills
+`MochiState.currentWatchLink`).
+
+Fixes in this build:
+- **Watch link keeps both segments:** the service now captures
+  `mochi.tv/watch/<seriesSlug>/<episodeNumber>` in full
+  (`watchLinkFrom()` helper, two-segment regex first, bare-id form as
+  fallback), at all three capture sites. A slug-only link can no
+  longer be produced from a two-segment link on screen.
+- **Steps 4 and 5 are actually implemented now.** The docstring always
+  listed them (an episode id on screen → /play; a watch link on
+  screen → lookup → /play), but `resolvePlaybackUrl` never read
+  `MochiState.currentPlaybackId` or `currentWatchLink` — so an
+  on-screen id/link was never used and every such tap fell through
+  to the Share flow. They now run before the title-based steps (they
+  need no title and identify the episode exactly).
+- **Slug-only link fallback:** if a watch link ever arrives with one
+  segment, `playbackUrlForWatchLink` first tries it as an episode id,
+  and if /play 404s it retries it as a series slug with the episode
+  number currently on screen (lookup → /play).
+- **Every failure now carries the "On screen" line.** The seen-summary
+  (`On screen: title=…, creator=…, episode=…`) used to be attached
+  only to the API resolution codes, so Share-flow failures like
+  `watch_page_no_stream` arrived with the code and nothing else —
+  that is why Alex saw "nothing afterwards". `fail()` now appends the
+  summary to every failure notification, whatever the step code.
+
 ## What this is NOT
 
 - It does not modify, re-sign, or patch the Mochi APK.

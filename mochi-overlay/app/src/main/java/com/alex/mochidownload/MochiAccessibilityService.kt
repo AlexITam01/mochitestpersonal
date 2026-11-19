@@ -45,7 +45,33 @@ class MochiAccessibilityService : AccessibilityService() {
         private const val MOCHI_PACKAGE = "com.mochitv.mochi"
         const val ACTION_REQUEST_SHARE_TAP =
             "com.alex.mochidownload.ACTION_REQUEST_SHARE_TAP"
-        private val WATCH_LINK = Regex("mochi\\.tv/watch/([A-Za-z0-9_-]+)")
+        /** mochi.tv/watch/<seriesSlug>/<episodeNumber> — the full
+         *  two-segment watch link. The episode number MUST be captured:
+         *  a slug-only link cannot be resolved to an episode, and
+         *  treating the slug as an episode id makes /play 404 — that
+         *  was the "watch_page_no_stream" failure (the old regex only
+         *  captured the slug and dropped the episode number). */
+        private val WATCH_LINK =
+            Regex("mochi\\.tv/watch/([A-Za-z0-9_-]+)/(\\d+)")
+        /** Fallback: a bare episode id (mochi.tv/watch/<episodeId>).
+         *  Only used when no two-segment link is present. */
+        private val WATCH_LINK_ONE_PART =
+            Regex("mochi\\.tv/watch/([A-Za-z0-9_-]+)")
+
+        /** Build the full watch URL from text that contains one.
+         *  Prefers the two-segment form (slug + episode number), which
+         *  is the only one that resolves to a specific episode; falls
+         *  back to the bare-id form. Returns null when there is no
+         *  watch link in the text. */
+        private fun watchLinkFrom(text: String): String? {
+            WATCH_LINK.find(text)?.let {
+                return "https://www.mochi.tv/watch/${it.groupValues[1]}/${it.groupValues[2]}"
+            }
+            WATCH_LINK_ONE_PART.find(text)?.let {
+                return "https://www.mochi.tv/watch/${it.groupValues[1]}"
+            }
+            return null
+        }
         private val MUX_URL = Regex("stream\\.mux\\.com/([A-Za-z0-9_-]+)")
         private val PLAYBACK_ID = Regex("playbackId[^A-Za-z0-9]{0,4}([A-Za-z0-9_-]{10,})")
         private val ANY_URL = Regex("https?://[^\\s\"'<>]+")
@@ -328,9 +354,7 @@ class MochiAccessibilityService : AccessibilityService() {
                 copyLinkNode = AccessibilityNodeInfo.obtain(n)
             }
             if (foundLink == null) {
-                WATCH_LINK.find(combined)?.let {
-                    foundLink = "https://www.mochi.tv/watch/${it.groupValues[1]}"
-                }
+                watchLinkFrom(combined)?.let { foundLink = it }
             }
             if (foundMuxId == null) {
                 MUX_URL.find(combined)?.let { foundMuxId = it.groupValues[1] }
@@ -425,9 +449,7 @@ class MochiAccessibilityService : AccessibilityService() {
                 fun visit(n: AccessibilityNodeInfo) {
                     val combined = "${n.text ?: ""} ${n.contentDescription ?: ""}"
                     if (visibleLink == null) {
-                        WATCH_LINK.find(combined)?.let {
-                            visibleLink = "https://www.mochi.tv/watch/${it.groupValues[1]}"
-                        }
+                        watchLinkFrom(combined)?.let { visibleLink = it }
                     }
                     for (i in 0 until n.childCount) {
                         val child = n.getChild(i) ?: continue
@@ -545,8 +567,8 @@ class MochiAccessibilityService : AccessibilityService() {
         val viewId = try { node.viewIdResourceName } catch (e: Exception) { null }
         for (candidate in listOf(text, desc, viewId)) {
             if (candidate.isNullOrBlank()) continue
-            WATCH_LINK.find(candidate)?.let {
-                MochiState.currentWatchLink = "https://www.mochi.tv/watch/${it.groupValues[1]}"
+            watchLinkFrom(candidate)?.let {
+                MochiState.currentWatchLink = it
             }
             MUX_URL.find(candidate)?.let {
                 MochiState.currentPlaybackId = it.groupValues[1]
