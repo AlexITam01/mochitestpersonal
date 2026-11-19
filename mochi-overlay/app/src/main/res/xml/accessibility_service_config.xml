@@ -1,9 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewTextChanged"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewTextChanged|typeNotificationStateChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"
     android:canRetrieveWindowContent="true"
     android:description="@string/accessibility_service_label"
-    android:packageNames="com.mochitv.mochi"
     android:settingsActivity="com.alex.mochidownload.MainActivity" />
+<!--
+  No android:packageNames here on purpose: during a share flow the share
+  sheet can live in another package (the Android system share sheet /
+  resolver), and the service must be able to read it. The service filters
+  in code: it only scans Mochi's UI normally, and only scans other
+  packages' windows while a user-started share flow is active — and it
+  only ever taps inside such a flow. typeNotificationStateChanged is
+  included so the service can hear Mochi's own download-result toasts
+  ("Saved to your Photos", "Downloads are off") during a share flow.
+-->

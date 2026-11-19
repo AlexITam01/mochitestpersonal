@@ -26,7 +26,10 @@ import android.widget.Toast
 class MainActivity : Activity() {
 
     private lateinit var statusText: TextView
+    private lateinit var positionText: TextView
     private lateinit var toggleButton: Button
+    private lateinit var lockButton: Button
+    private lateinit var moveButton: Button
     private val handler = Handler(Looper.getMainLooper())
     private val statusRunnable = object : Runnable {
         override fun run() {
@@ -40,13 +43,18 @@ class MainActivity : Activity() {
         setContentView(R.layout.activity_main)
 
         statusText = findViewById(R.id.status_text)
+        positionText = findViewById(R.id.position_text)
         toggleButton = findViewById(R.id.toggle_button)
+        lockButton = findViewById(R.id.lock_button)
+        moveButton = findViewById(R.id.move_button)
         val overlayPermButton: Button = findViewById(R.id.overlay_perm_button)
         val usagePermButton: Button = findViewById(R.id.usage_perm_button)
         val a11yButton: Button = findViewById(R.id.a11y_button)
         val howButton: Button = findViewById(R.id.how_button)
 
         toggleButton.setOnClickListener { toggleOverlay() }
+        lockButton.setOnClickListener { lockPosition() }
+        moveButton.setOnClickListener { movePosition() }
         overlayPermButton.setOnClickListener {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                 Uri.parse("package:$packageName")))
@@ -59,11 +67,44 @@ class MainActivity : Activity() {
         }
         howButton.setOnClickListener {
             Toast.makeText(this,
-                "Long-press the floating button to move it. Tap it to download " +
-                    "the video Mochi is playing. See README in the repo for " +
-                    "why a download sometimes cannot be resolved.",
+                "1. Long-press the floating button in Mochi and drag it " +
+                    "where you want it. Release to place it (it stays dimmed).\n" +
+                    "2. Come back here and press \"Lock position\" — the button " +
+                    "becomes fixed and tappable: tap it in Mochi to download.\n" +
+                    "3. To move it later, press \"Move button\", drag it to a " +
+                    "new spot, and lock it again here.\n" +
+                    "A tap opens Mochi's Share menu to get the video link (or " +
+                    "uses Mochi's own Download). See README for the limits.",
                 Toast.LENGTH_LONG).show()
         }
+    }
+
+    /** Confirm the placed position: lock the floating button as the
+     *  pressable download button. */
+    private fun lockPosition() {
+        val prefs = getSharedPreferences(OverlayService.PREFS, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(OverlayService.KEY_HAS_POSITION, false) &&
+            prefs.getInt(OverlayService.KEY_X, -1) < 0
+        ) {
+            Toast.makeText(this,
+                "No position placed yet — long-press the floating button " +
+                    "in Mochi, drag it where you want it, release, then " +
+                    "press this button.",
+                Toast.LENGTH_LONG).show()
+            return
+        }
+        OverlayService.confirmPosition(this)
+        refreshStatus()
+    }
+
+    /** Unlock the button and re-enter positioning mode. */
+    private fun movePosition() {
+        OverlayService.requestReposition(this)
+        Toast.makeText(this,
+            "Positioning mode on — drag the button in Mochi to a new " +
+                "spot, release, then press \"Lock position\" here.",
+            Toast.LENGTH_LONG).show()
+        refreshStatus()
     }
 
     override fun onResume() {
@@ -133,6 +174,33 @@ class MainActivity : Activity() {
         }
         statusText.text = sb.toString()
         toggleButton.text = if (running) "Stop overlay" else "Start overlay"
+
+        // Position state (the two-step confirm flow).
+        val prefs = getSharedPreferences(OverlayService.PREFS, Context.MODE_PRIVATE)
+        val hasPosition = prefs.getBoolean(OverlayService.KEY_HAS_POSITION, false) ||
+            prefs.getInt(OverlayService.KEY_X, -1) >= 0
+        val confirmed = prefs.getBoolean(OverlayService.KEY_CONFIRMED, false)
+        val posX = prefs.getInt(OverlayService.KEY_X, -1)
+        val posY = prefs.getInt(OverlayService.KEY_Y, -1)
+        when {
+            !hasPosition -> {
+                positionText.text = getString(R.string.position_none)
+                lockButton.isEnabled = false
+                moveButton.isEnabled = false
+            }
+            !confirmed -> {
+                positionText.text = getString(R.string.position_pending) +
+                    " (placed at $posX, $posY)"
+                lockButton.isEnabled = true
+                moveButton.isEnabled = false
+            }
+            else -> {
+                positionText.text = getString(R.string.position_locked) +
+                    " (locked at $posX, $posY)"
+                lockButton.isEnabled = false
+                moveButton.isEnabled = true
+            }
+        }
     }
 
     private fun isUsageAccessGranted(): Boolean {

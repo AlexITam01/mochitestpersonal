@@ -1,5 +1,8 @@
 package com.alex.mochidownload
 
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
 /**
  * Shared, best-effort snapshot of what Mochi is showing right now.
  *
@@ -19,6 +22,12 @@ package com.alex.mochidownload
  * playbackId lives inside Mochi's own app state and is NOT shown in the
  * UI, so it is usually not here. That is why a tap cannot always resolve
  * a download — see [VideoDownloader] and README.md.
+ *
+ * Share flow: when Alex taps the overlay download button and no link is
+ * already known, [VideoDownloader] asks the AccessibilityService to use
+ * Mochi's own Share flow (tap Share, read the link from the share sheet).
+ * That handshake is coordinated here with a latch: the downloader waits
+ * (bounded time) for the service to report one result string.
  */
 object MochiState {
     @Volatile var isMochiForeground: Boolean = false
@@ -64,6 +73,59 @@ object MochiState {
         anchorAtMs = 0L
     }
 
+    // ----- Share-flow handshake (see class doc) -----
+    //
+    // Result strings (exactly one is delivered per flow):
+    //   "native:<text>"   — Mochi's own "Download video" was tapped; <text>
+    //                       is Mochi's own toast/result if one was seen
+    //                       ("Saved to your Photos", "Downloads are off", …),
+    //                       or "" if none was seen before the flow closed.
+    //   "link:<url>"      — a mochi.tv/watch (or other Mochi) link was read
+    //                       from the share sheet / clipboard.
+    //   "error:<code>"    — the flow failed; <code> is one of:
+    //                       share_button_not_found, share_sheet_timeout,
+    //                       no_share_option, clipboard_empty,
+    //                       share_sheet_dismissed
+    // Only the flow started by Alex tapping the download button may tap
+    // anything in Mochi. Outside a flow the service is strictly read-only.
+
+    @Volatile var shareFlowActive: Boolean = false
+    @Volatile var shareFlowDeadlineMs: Long = 0L
+    @Volatile private var shareLatch: CountDownLatch? = null
+    @Volatile var shareFlowResult: String? = null
+
+    /** Start a new share flow; returns the latch the caller waits on. */
+    fun beginShareFlow(timeoutMs: Long): CountDownLatch {
+        val latch = CountDownLatch(1)
+        shareLatch = latch
+        shareFlowResult = null
+        shareFlowActive = true
+        shareFlowDeadlineMs = System.currentTimeMillis() + timeoutMs
+        return latch
+    }
+
+    /** Called by the AccessibilityService when the flow reaches a result. */
+    fun completeShareFlow(result: String) {
+        if (!shareFlowActive) return
+        shareFlowResult = result
+        shareFlowActive = false
+        shareLatch?.countDown()
+    }
+
+    /** Wait for the flow result (bounded); null if it timed out. */
+    fun awaitShareFlow(timeoutMs: Long): String? {
+        val latch = shareLatch ?: return null
+        return try {
+            if (latch.await(timeoutMs, TimeUnit.MILLISECONDS)) shareFlowResult else null
+        } catch (e: InterruptedException) {
+            null
+        }
+    }
+
+    /** True while a share flow is running and not yet past its deadline. */
+    fun shareFlowLive(): Boolean =
+        shareFlowActive && System.currentTimeMillis() < shareFlowDeadlineMs
+
     fun reset() {
         isMochiForeground = false
         currentTitle = null
@@ -71,5 +133,8 @@ object MochiState {
         currentPlaybackId = null
         lastTitleAtMs = 0L
         clearAnchor()
+        shareFlowActive = false
+        shareFlowResult = null
+        shareLatch = null
     }
 }

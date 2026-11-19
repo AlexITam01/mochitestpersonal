@@ -1,9 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Mochi Download</string>
-    <string name="intro">A floating download button for Mochi. It only appears while Mochi is open. Drag it anywhere; long-press it to lock the position; tap it to download the video Mochi is playing.</string>
+    <string name="intro">A floating download button for Mochi. It only appears while Mochi is open. Long-press it to move it, release to place it, then press “Lock position” here to make it the download button. Tap the locked button to download the video Mochi is playing.</string>
     <string name="status_loading">Checking permissions…</string>
     <string name="start_overlay">Start overlay</string>
+    <string name="lock_position">Lock position — make it the download button</string>
+    <string name="move_button">Move button — reposition it</string>
+    <string name="position_none">Button position: none placed yet. Long-press the floating button in Mochi and drag it where you want it.</string>
+    <string name="position_pending">Button position: PLACED but not confirmed. Press “Lock position” below to make it the download button.</string>
+    <string name="position_locked">Button position: LOCKED. The floating button is fixed there — tap it in Mochi to download. Press “Move button” to change the spot.</string>
     <string name="grant_overlay">1. Allow “Draw over other apps”</string>
     <string name="grant_usage">2. Allow “Usage access” (so it only shows over Mochi)</string>
     <string name="enable_a11y">3. Turn on the Accessibility Service (reads the video title)</string>

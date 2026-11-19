@@ -30,19 +30,33 @@ import android.widget.Toast
  * Behaviour (exactly what Alex asked for):
  * 1. Runs concurrently with Mochi. The service is alive while Mochi is in
  *    the foreground; the button is only drawn over Mochi.
- * 2. Long-press the button to enter positioning mode, drag it where it
- *    should go, and on RELEASE the position is recorded and persisted
- *    (SharedPreferences). No separate "save" step.
+ * 2. Positioning is TWO steps. Long-press the button to enter positioning
+ *    mode, drag it where it should go, and on RELEASE the position is
+ *    recorded and persisted (SharedPreferences) — but it is NOT locked
+ *    yet. It stays in a "positioned, not confirmed" state (dashed outline,
+ *    dimmed) and tapping it does nothing except remind Alex to confirm.
+ *    Alex then opens the Mochi Download app and presses "Lock position".
+ *    ONLY then does the button become the active download button at that
+ *    spot: fixed in place, pressable, tap = download. Once locked it is
+ *    NOT draggable any more — long-press does nothing. To move it again,
+ *    Alex presses "Move button" in the app, which unlocks it and
+ *    re-enters positioning mode; he drags it to a new spot and confirms
+ *    again. States: (a) positioning — draggable, not a download button;
+ *    (b) confirmed/locked — fixed, pressable, tap = download;
+ *    (c) reposition — via the app's Move control, back to (a).
  * 3. The overlay closes when Mochi closes (the button window is removed),
  *    and when Mochi opens again it reopens automatically at that same
  *    recorded position — the button is back on the same spot where it was
  *    left. The service keeps a lightweight watch so it can re-show it.
  * 4. Alex navigates Mochi himself. This app never taps, swipes, or scrolls
  *    Mochi for him; it only reads (AccessibilityService) and draws its own
- *    button.
- * 5. Tap the button (when locked) to download the video Mochi is currently
+ *    button. The one exception is the download's share flow (see
+ *    VideoDownloader / MochiAccessibilityService): when Alex taps the
+ *    locked button, the AccessibilityService taps Mochi's Share button on
+ *    his behalf to get the video link.
+ * 5. Tap the LOCKED button to download the video Mochi is currently
  *    playing, saved to the device's Downloads folder (see VideoDownloader
- *    for the honest limits on resolving the link).
+ *    for how the link is resolved).
  *
  * Suckerfish anchoring: where Mochi's player action column (like / comment
  * / share) is visible, the button latches onto it — it sits just below the
@@ -61,6 +75,8 @@ class OverlayService : Service() {
 
     companion object {
         const val ACTION_STOP = "com.alex.mochidownload.ACTION_STOP"
+        const val ACTION_CONFIRM = "com.alex.mochidownload.ACTION_CONFIRM"
+        const val ACTION_REPOSITION = "com.alex.mochidownload.ACTION_REPOSITION"
         const val PREFS = "mochi_overlay"
         const val KEY_X = "pos_x"
         const val KEY_Y = "pos_y"
@@ -68,6 +84,37 @@ class OverlayService : Service() {
         const val KEY_OFF_X = "anchor_off_x"
         const val KEY_OFF_Y = "anchor_off_y"
         const val KEY_HAS_OFF = "has_anchor_off"
+        /** A position has been placed (by dragging) at least once. */
+        const val KEY_HAS_POSITION = "has_position"
+        /** The placed position has been confirmed in the app: the button is
+         *  the locked, pressable download button. False while positioning
+         *  or while a placed position is waiting for confirmation. */
+        const val KEY_CONFIRMED = "position_confirmed"
+
+        /** MainActivity: confirm the placed position (lock the button). */
+        fun confirmPosition(context: Context) {
+            val intent = Intent(context, OverlayService::class.java).apply {
+                action = ACTION_CONFIRM
+            }
+            try {
+                context.startForegroundService(intent)
+            } catch (e: Exception) {
+                try { context.startService(intent) } catch (e2: Exception) { }
+            }
+        }
+
+        /** MainActivity: unlock and re-enter positioning mode. */
+        fun requestReposition(context: Context) {
+            val intent = Intent(context, OverlayService::class.java).apply {
+                action = ACTION_REPOSITION
+            }
+            try {
+                context.startForegroundService(intent)
+            } catch (e: Exception) {
+                try { context.startService(intent) } catch (e2: Exception) { }
+            }
+        }
+
         const val MOCHI_PACKAGE = "com.mochitv.mochi"
         private const val NOTIF_CHANNEL = "mochi_overlay"
         private const val NOTIF_ID = 1
@@ -127,12 +174,63 @@ class OverlayService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        if (intent?.action == ACTION_CONFIRM) {
+            confirmLockedPosition()
+            prefs.edit().putBoolean(KEY_ENABLED, true).apply()
+            handler.removeCallbacks(pollRunnable)
+            handler.post(pollRunnable)
+            updateVisibilityAndAnchor()
+            return START_STICKY
+        }
+        if (intent?.action == ACTION_REPOSITION) {
+            // Unlock and re-enter positioning mode (state (c) -> (a)).
+            prefs.edit().putBoolean(KEY_CONFIRMED, false).apply()
+            prefs.edit().putBoolean(KEY_ENABLED, true).apply()
+            handler.removeCallbacks(pollRunnable)
+            handler.post(pollRunnable)
+            updateVisibilityAndAnchor()
+            if (buttonVisible) {
+                enterEditMode()
+                Toast.makeText(this,
+                    "Move the button, then release. Confirm it in the app when done.",
+                    Toast.LENGTH_LONG).show()
+            } else {
+                Toast.makeText(this,
+                    "Open Mochi — the button will appear, ready to move.",
+                    Toast.LENGTH_LONG).show()
+            }
+            return START_STICKY
+        }
         prefs.edit().putBoolean(KEY_ENABLED, true).apply()
         handler.removeCallbacks(pollRunnable)
         handler.post(pollRunnable)
         updateVisibilityAndAnchor()
         return START_STICKY
     }
+
+    /** Lock the placed position: the button becomes the fixed, pressable
+     *  download button. Only called from the app's confirm button. */
+    private fun confirmLockedPosition() {
+        if (!prefs.getBoolean(KEY_HAS_POSITION, false) &&
+            prefs.getInt(KEY_X, -1) < 0
+        ) {
+            Toast.makeText(this,
+                "No position placed yet — long-press the button, drag it " +
+                    "where you want it, then confirm.",
+                Toast.LENGTH_LONG).show()
+            return
+        }
+        editMode = false
+        prefs.edit().putBoolean(KEY_CONFIRMED, true).apply()
+        applyButtonState()
+        Toast.makeText(this,
+            "Position locked — tap the button to download the video.",
+            Toast.LENGTH_SHORT).show()
+    }
+
+    /** Is the button currently the locked, pressable download button? */
+    private fun isConfirmed(): Boolean =
+        prefs.getBoolean(KEY_CONFIRMED, false)
 
     override fun onDestroy() {
         handler.removeCallbacks(pollRunnable)
@@ -280,10 +378,12 @@ class OverlayService : Service() {
     }
 
     /** Record the button's current spot and persist it. Called on release
-     *  after a drag in positioning mode (and on tap-to-lock). If an anchor
-     *  is visible, the spot is stored as an offset from that anchor so it
-     *  keeps tracking the UI; otherwise it is stored as an absolute
-     *  position. */
+     *  after a drag in positioning mode (and on tap-to-lock). The spot is
+     *  stored as PENDING — it is NOT confirmed yet. Alex confirms it in
+     *  the app; only then does the button become the download button.
+     *  If an anchor is visible, the spot is stored as an offset from that
+     *  anchor so it keeps tracking the UI; otherwise it is stored as an
+     *  absolute position. */
     private fun recordPosition() {
         val lp = params ?: return
         if (MochiState.hasAnchor()) {
@@ -295,11 +395,15 @@ class OverlayService : Service() {
                 .putBoolean(KEY_HAS_OFF, true)
                 .putInt(KEY_X, lp.x)
                 .putInt(KEY_Y, lp.y)
+                .putBoolean(KEY_HAS_POSITION, true)
+                .putBoolean(KEY_CONFIRMED, false)
                 .apply()
         } else {
             prefs.edit()
                 .putInt(KEY_X, lp.x)
                 .putInt(KEY_Y, lp.y)
+                .putBoolean(KEY_HAS_POSITION, true)
+                .putBoolean(KEY_CONFIRMED, false)
                 .apply()
         }
         lastAnchorL = MochiState.anchorLeft
@@ -338,7 +442,7 @@ class OverlayService : Service() {
         lastAnchorT = MochiState.anchorTop
         lastAnchorR = MochiState.anchorRight
         lastAnchorB = MochiState.anchorBottom
-        applyEditHighlight()
+        applyButtonState()
     }
 
     private fun removeButton() {
@@ -350,31 +454,52 @@ class OverlayService : Service() {
         editMode = false
     }
 
-    private fun applyEditHighlight() {
+    /**
+     * The button's look tells Alex which state it is in:
+     *  - positioning (edit mode): dashed outline, slightly dimmed — draggable.
+     *  - placed but NOT confirmed: dashed outline, more dimmed — it is not
+     *    a download button yet; tap only reminds him to confirm in the app.
+     *  - confirmed/locked: plain, full opacity — the fixed download button.
+     */
+    private fun applyButtonState() {
         val b = button ?: return
-        if (editMode) {
-            b.setBackgroundResource(R.drawable.button_edit_outline)
-            b.alpha = 0.85f
-        } else {
-            b.setBackgroundResource(0)
-            b.alpha = 1.0f
+        when {
+            editMode -> {
+                b.setBackgroundResource(R.drawable.button_edit_outline)
+                b.alpha = 0.85f
+            }
+            !isConfirmed() -> {
+                b.setBackgroundResource(R.drawable.button_edit_outline)
+                b.alpha = 0.6f
+            }
+            else -> {
+                b.setBackgroundResource(0)
+                b.alpha = 1.0f
+            }
         }
     }
 
     private fun enterEditMode() {
         if (button == null || editMode) return
+        if (isConfirmed()) return // Locked: long-press does nothing.
         editMode = true
-        applyEditHighlight()
-        Toast.makeText(this, "Move the button, then release to lock the position",
+        applyButtonState()
+        Toast.makeText(this, "Move the button, then release to place it",
             Toast.LENGTH_SHORT).show()
     }
 
+    /** Released after a drag in positioning mode: the spot is recorded and
+     *  persisted as PENDING — it is not locked yet. Alex confirms it in
+     *  the app; only then does the button become the download button. */
     private fun exitEditModeAndSave() {
         if (!editMode) return
         editMode = false
-        applyEditHighlight()
         recordPosition()
-        Toast.makeText(this, "Position saved", Toast.LENGTH_SHORT).show()
+        applyButtonState()
+        Toast.makeText(this,
+            "Position placed — open Mochi Download and press " +
+                "\"Lock position\" to make it the download button.",
+            Toast.LENGTH_LONG).show()
     }
 
     private val buttonTouchListener = View.OnTouchListener { _, event ->
@@ -389,7 +514,10 @@ class OverlayService : Service() {
                 downParamY = lp.y
                 moved = false
                 handler.removeCallbacks(longPressRunnable)
-                handler.postDelayed(longPressRunnable, LONG_PRESS_MS)
+                // A locked button cannot be dragged: no long-press.
+                if (!isConfirmed()) {
+                    handler.postDelayed(longPressRunnable, LONG_PRESS_MS)
+                }
                 true
             }
             MotionEvent.ACTION_MOVE -> {
@@ -411,17 +539,23 @@ class OverlayService : Service() {
                 if (!moved) {
                     // A tap.
                     if (editMode) {
-                        // Tap while positioning: lock the spot.
+                        // Tap while positioning: place the spot (pending).
                         exitEditModeAndSave()
-                    } else {
-                        // Tap (locked) = download the video Mochi is playing.
+                    } else if (isConfirmed()) {
+                        // Tap on the LOCKED button = download the video.
                         VideoDownloader.onDownloadTapped(this)
+                    } else {
+                        // Placed but not confirmed yet: not a download
+                        // button. Point Alex at the confirm step.
+                        Toast.makeText(this,
+                            "Position not confirmed yet — open Mochi " +
+                                "Download and press \"Lock position\".",
+                            Toast.LENGTH_LONG).show()
                     }
                 } else if (editMode) {
                     // Released after a drag in positioning mode: the spot
-                    // is recorded and persisted right here, and the button
-                    // locks. This is the "on release" behaviour Alex asked
-                    // for — no separate save step.
+                    // is recorded and persisted as PENDING — no auto-lock.
+                    // Alex confirms it in the app.
                     exitEditModeAndSave()
                 }
                 true
