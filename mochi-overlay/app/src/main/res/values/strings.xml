@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Mochi Download</string>
+    <string name="intro">A floating download button for Mochi. It only appears while Mochi is open. Drag it anywhere; long-press it to lock the position; tap it to download the video Mochi is playing.</string>
+    <string name="status_loading">Checking permissions…</string>
+    <string name="start_overlay">Start overlay</string>
+    <string name="grant_overlay">1. Allow “Draw over other apps”</string>
+    <string name="grant_usage">2. Allow “Usage access” (so it only shows over Mochi)</string>
+    <string name="enable_a11y">3. Turn on the Accessibility Service (reads the video title)</string>
+    <string name="how_it_works">How it works (and its limits)</string>
+    <string name="accessibility_service_label">Mochi Download — reads the video title</string>
+</resources>
