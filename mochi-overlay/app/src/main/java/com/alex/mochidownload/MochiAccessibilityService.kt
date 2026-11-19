@@ -19,12 +19,16 @@ import android.view.accessibility.AccessibilityNodeInfo
  * sits on screen.
  *
  * What it CAN see (the visible UI): the video title / creator text, the
- * bounds of on-screen elements (including the like / comment / share action
- * column), and — if Mochi ever shows one — a mochi.tv/watch link or a Mux
- * playbackId. What it CANNOT see: the video's stream URL. That lives in
- * Mochi's internal app state and in its encrypted (HTTPS) traffic, neither
- * of which an AccessibilityService can read. See README.md for why the
- * download is best-effort.
+ * episode number when the player shows one, the bounds of on-screen
+ * elements (including the like / comment / share action column), and —
+ * if Mochi ever shows one — a mochi.tv/watch link or a Mux playbackId.
+ * What it CANNOT see: the video's stream URL. That lives in Mochi's
+ * internal app state and in its encrypted (HTTPS) traffic, neither of
+ * which an AccessibilityService can read. That is why the overlay
+ * resolves the playing video through Mochi's public API (MochiApi):
+ * the on-screen title (+ creator + episode number) identifies the
+ * episode, and the API returns the signed playback URL. See README.md
+ * for the full resolution order and the failure codes.
  *
  * The ONE exception to "read-only": the share flow. When Alex taps the
  * overlay download button and no link is already known, [VideoDownloader]
@@ -45,6 +49,16 @@ class MochiAccessibilityService : AccessibilityService() {
         private val MUX_URL = Regex("stream\\.mux\\.com/([A-Za-z0-9_-]+)")
         private val PLAYBACK_ID = Regex("playbackId[^A-Za-z0-9]{0,4}([A-Za-z0-9_-]{10,})")
         private val ANY_URL = Regex("https?://[^\\s\"'<>]+")
+        /** A signed Mux playback URL, if one is ever visible on screen. */
+        private val SIGNED_MUX_URL =
+            Regex("https://stream\\.mux\\.com/[A-Za-z0-9_-]+\\.m3u8\\?token=[^\\s\"'<>]+")
+        /** "Episode 5", "Ep 5", "Ep. 5" or a standalone "E5" — how the
+         *  player labels the episode number, when it shows one at all.
+         *  Group 1 is the word form, group 2 the bare "E5" form. */
+        private val EPISODE_NUMBER =
+            Regex("(?i)\\b(?:episode|ep\\.?)\\s*#?\\s*(\\d{1,4})\\b|\\bE(\\d{1,4})\\b")
+        /** "@username" — the creator handle shown under the video. */
+        private val CREATOR_HANDLE = Regex("@([A-Za-z0-9_.]{2,32})")
         // Words that mark the video player's action buttons.
         private val ACTION_WORDS = listOf(
             "share", "like", "comment", "save", "bookmark", "follow", "more"
@@ -528,6 +542,24 @@ class MochiAccessibilityService : AccessibilityService() {
             }
             PLAYBACK_ID.find(candidate)?.let {
                 MochiState.currentPlaybackId = it.groupValues[1]
+            }
+            SIGNED_MUX_URL.find(candidate)?.let {
+                MochiState.currentPlaybackUrl = it.value
+            }
+            // Creator handle + episode number: the two extra signals the
+            // API resolution needs to identify the playing episode.
+            // Only set them from a leaf node's own text, so a stray
+            // "@someone" in a comment does not overwrite the creator.
+            if (node.childCount == 0 && !text.isNullOrBlank()) {
+                CREATOR_HANDLE.find(text)?.let {
+                    MochiState.currentCreator = it.groupValues[1]
+                }
+                EPISODE_NUMBER.find(text)?.let {
+                    val num = it.groupValues[1].ifEmpty { it.groupValues[2] }
+                    num.toIntOrNull()?.let { n ->
+                        MochiState.currentEpisodeNumber = n
+                    }
+                }
             }
         }
         // Heuristic for the video title: the longest non-empty text on a

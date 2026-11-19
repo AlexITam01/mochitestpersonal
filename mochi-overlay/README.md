@@ -51,12 +51,15 @@ Package: `com.alex.mochidownload` · App name: "Mochi Download" · minSdk 26.
    from a spot he chose.
 4. **Alex drives Mochi himself.** The overlay never taps, swipes, scrolls,
    or navigates Mochi for him. He taps/swipes/scrolls to the video he
-   wants; the button just sits there waiting. The ONE exception is the
-   download itself (see below): when he taps the locked button, the
-   AccessibilityService taps Mochi's Share button on his behalf to get
-   the video's link. That is the only time the service ever taps anything.
+   wants; the button just sits there waiting. The download itself is
+   resolved through Mochi's public API from what is already on screen
+   (title / creator / episode number) — no tapping inside Mochi. The ONE
+   exception is the Share-flow fallback (see below): when the API cannot
+   identify the video, the AccessibilityService taps Mochi's Share button
+   on his behalf to get the video's link. That is the only time the
+   service ever taps anything.
 5. **Tap (locked) = download.** Tap the locked button to download the
-   video Mochi is currently playing, saved to the device's
+   video Mochi is currently playing, saved as one .mp4 to the device's
    `Downloads/Mochi/` folder — or, if Mochi's own Download is used, saved
    to Photos by Mochi itself. See the download section below.
 
@@ -97,20 +100,59 @@ The MainActivity has a button for each and a live status readout.
 
 ## The download — how a tap actually gets the video
 
-Mochi plays video from Mux as HLS: `https://stream.mux.com/<playbackId>.m3u8`.
-The `playbackId` lives inside Mochi's app state and in its HTTPS traffic.
-A separate overlay app **cannot** read either of those directly — so the
-previous build could only download when a link happened to be visible on
-screen, which in practice was almost never. That is why the download was
-"still flawed". This build fixes it by using Mochi's own Share flow, which
-is Mochi's own feature for surfacing a video's link.
+Mochi plays video from Mux as HLS. The video's stream URL lives inside
+Mochi's app state and in its HTTPS traffic. A separate overlay app cannot
+read either of those directly — and a plain VPN cannot either, because
+the URL path is inside HTTPS (a VPN sees `stream.mux.com`, not the
+playback id). So the overlay resolves the playing video through Mochi's
+own public read API instead: the AccessibilityService reads the title /
+creator / episode number from the player UI, and the API turns that
+into the signed stream URL.
+
+**The source, verified live 2026-11-19 (no login, no auth header):**
+Mochi's mobile API is public for reads. `POST /api/mobile/for-you`
+(body `{}`) returns the For You feed, and every episode already carries
+a signed `playbackUrl` — a Mux `.m3u8` URL with a `?token=` query
+param. `GET /api/mobile/search?q=<title>` finds a series (id, slug,
+creator). `GET /api/mobile/lookup-episode/<seriesSlug>/<episodeNumber>`
+resolves a series + episode to an episode id.
+`GET /api/mobile/episodes/<episodeId>/play` returns the signed
+playbackUrl for that episode. These are the same endpoints the Mochi
+app itself calls to play a video.
+
+**Why the old download was flawed:** the old build constructed a bare
+Mux URL from a playback id (`https://stream.mux.com/<id>/highest.mp4`).
+That does not work for Mochi's signed playback ids — the static MP4
+returns 404, and even `.../highest.mp4?token=<signed JWT>` returns 403.
+The only working source is the signed `.m3u8` from `/play` (or from the
+feed). And an `.m3u8` is an HLS playlist, not a file — so the overlay
+downloads the stream itself: it fetches the master playlist, picks the
+highest-bandwidth video rendition (1080p) plus the audio rendition,
+downloads the fMP4 init segment + `.m4s` media segments in parallel,
+and remuxes them with Android's built-in `MediaExtractor` + `MediaMuxer`
+into ONE playable `.mp4` with audio and video. No ffmpeg, no root, no
+extra dependency. The video rendition is video-only and the audio
+rendition is audio-only, so the remux is what puts sound back with the
+picture. If a rendition ever carries both tracks, the remux takes the
+audio from the video file instead. The result is saved to
+`Downloads/Mochi/<Series Title> - E<number>.mp4` (via MediaStore).
 
 Tap flow (in order — first success wins):
 
-1. **A playbackId already seen on screen** (rare). Download it.
-2. **A mochi.tv/watch link already seen on screen.** Fetch the public
-   watch page and extract the Mux playbackId from it.
-3. **Mochi's Share flow (the normal path).** The AccessibilityService taps
+1. **A signed playback URL already seen on screen** (rare). Download it.
+2. **For You feed match (the normal no-Share path).** Fetch the public
+   For You feed and match the on-screen series title (+ creator, +
+   episode number when shown) to a feed episode; take that episode's
+   signed playbackUrl and download the stream.
+3. **Title search + lookup.** Search the on-screen title, take the series
+   slug, resolve (slug, episode number) to an episode id, then `/play`
+   for the signed playbackUrl. Needs the episode number from the UI; if
+   the player is not showing one, this step is skipped.
+4. **An episode id already seen on screen** -> `/play` -> playbackUrl.
+5. **A mochi.tv/watch link already seen on screen**
+   (`mochi.tv/watch/<seriesSlug>/<episodeNumber>`) -> lookup ->
+   `/play` -> playbackUrl.
+6. **Mochi's Share flow (the fallback).** The AccessibilityService taps
    Mochi's Share button in the player action column, then works the share
    sheet that opens:
    - If the sheet has Mochi's own **"Download video"**, it taps it.
@@ -119,41 +161,55 @@ Tap flow (in order — first success wins):
      outcome. (Mochi's own download can be refused per video — "Downloads
      are off" — in which case the flow carries on to the link.)
    - Otherwise it taps **"Copy link"** and reads the copied link from the
-     clipboard, then fetches that watch page as in (2).
+     clipboard, then resolves that watch link through the API as in (5).
    - Otherwise, if the sheet shows a mochi.tv/watch (or Mux) URL as text,
      that is used directly.
    - The sheet is dismissed with one BACK afterwards, so Alex is back to
      watching.
-   When a playbackId is known, the app first tries the Mux MP4 rendition
-   (`https://stream.mux.com/<id>/highest.mp4`). If that is not available
-   it downloads the HLS playlist (`<id>.m3u8`) and says so — the playlist
-   plays in VLC and can be converted to MP4. Files go to `Downloads/Mochi/`.
 
 **If a step fails, the app says exactly which step failed** (toast + a
-notification with the step code): `share_button_not_found` (no Share button
-on this screen), `share_sheet_timeout` (the share menu did not open),
-`no_share_option` (the menu had no Download or Copy link), `clipboard_empty`
-("Copy link" was tapped but the link could not be read back — Android
-restricts background clipboard reads), `watch_page_failed` (the share
-page could not be loaded), `watch_page_no_stream` (the page loaded but
-had no stream link in it), `a11y_not_enabled`, `mochi_not_foreground`,
-`native_download_unavailable` (Mochi refused its own download). It never
-pretends a download happened when it did not.
+notification with the step code): `no_title` (no video title is visible,
+so the playing video cannot be identified), `feed_no_match` (the For You
+feed has no episode with this title — the guest feed is only the first
+page), `feed_ambiguous`, `episode_number_unknown` (the series was found
+but the player is not showing which episode it is), `lookup_failed`,
+`play_failed`, `api_failed` (Mochi's API could not be reached),
+`hls_master_failed` / `hls_no_rendition` / `hls_rendition_failed` /
+`hls_no_segments` / `hls_segment_failed` / `hls_remux_failed` (the stream
+download failed at that step), `save_failed` (the .mp4 was built but
+could not be put into Downloads/Mochi/), `share_button_not_found` (no
+Share button on this screen), `share_sheet_timeout` (the share menu did
+not open), `no_share_option` (the menu had no Download or Copy link),
+`clipboard_empty` ("Copy link" was tapped but the link could not be read
+back — Android restricts background clipboard reads),
+`watch_page_no_stream` (the share link gave no stream URL),
+`a11y_not_enabled`, `mochi_not_foreground`,
+`native_download_unavailable` (Mochi refused its own download),
+`mux_id_unresolved` (the share sheet gave a bare Mux id that could not
+be matched to an episode). It never pretends a download happened when
+it did not.
 
 Honest limits that remain:
-- The Share flow is the only way the overlay can learn the video's link.
-  If Mochi changes its share menu so it has neither Download nor Copy
-  link, the overlay cannot resolve the video.
-- The watch page is fetched as plain HTML. If Mochi ever makes the watch
-  page require sign-in or JavaScript to reveal the stream URL, the page
-  fetch will find nothing and report `watch_page_no_stream`.
+- The For You feed match uses the public (guest) feed, which is only the
+  first page of episodes. If the video Alex is watching is not in that
+  page, the feed match fails and the overlay falls through to search +
+  lookup (which needs the episode number from the UI) and then to the
+  Share flow. The Share flow is the most reliable identification, because
+  Mochi itself hands over the exact link.
+- The episode number is only used when the player shows it. If a series
+  has several episodes and the player shows no episode number, the
+  overlay cannot tell which one is playing from the title alone — it
+  says `episode_number_unknown` and falls back to the Share flow.
 - Mochi's own "Download video" appears to be for the creator's own
   published episodes (`downloadMyPublished…` in the bundle); it may not be
   offered for every video. When it is offered it is the most reliable
   path, because Mochi does the download itself.
 - No MITM, no root, no Mochi modification: the app deliberately does not
-  intercept Mochi's HTTPS traffic (it would need a user CA certificate and
-  Mochi would likely block it with certificate pinning).
+  intercept Mochi's HTTPS traffic (it would need a user CA certificate
+  and Mochi would likely block it with certificate pinning). The stream
+  URL comes from Mochi's public API, not from its traffic.
+- The signed playback URL expires (playbackExpiresAt, roughly a day), so
+  a resolved URL is used immediately on the same tap, never stored.
 
 The reliable fallback is still **PCAPdroid**: run it while the video plays,
 find the `stream.mux.com` request, and save the file.
@@ -181,13 +237,26 @@ find the `stream.mux.com` request, and save the file.
     package — the service filters in code and only scans other packages'
     windows while a share flow is active.
   - `MochiState.kt` — shared best-effort snapshot of what Mochi is showing,
-    including the anchor bounds, plus the share-flow handshake (a latch
-    the downloader waits on for the flow's single result string).
-  - `VideoDownloader.kt` — resolves a video (screen link, watch page, or
-    the share flow) and downloads via DownloadManager to `Downloads/Mochi/`;
-    step-specific failure reporting (`share_button_not_found`,
-    `share_sheet_timeout`, `no_share_option`, `clipboard_empty`,
-    `watch_page_failed`, `watch_page_no_stream`, …).
+    including the anchor bounds, the on-screen title / creator / episode
+    number / watch link / playback id, plus the share-flow handshake (a
+    latch the downloader waits on for the flow's single result string).
+  - `MochiApi.kt` — Mochi's public mobile API (no login): For You feed,
+    series search, episode lookup, and the /play endpoint that returns
+    the signed playback URL. All verified live; see the file header for
+    the exact endpoints and what each returns.
+  - `HlsDownloader.kt` — downloads a signed Mux HLS stream (master
+    playlist -> best video rendition + audio rendition -> fMP4 segments)
+    and remuxes it with MediaExtractor + MediaMuxer into one .mp4.
+    Step-specific failure codes (`hls_master_failed`, `hls_no_rendition`,
+    `hls_rendition_failed`, `hls_no_segments`, `hls_segment_failed`,
+    `hls_remux_failed`).
+  - `VideoDownloader.kt` — resolves the playing video (API first: feed
+    match, search + lookup, on-screen id/link; Share flow as fallback)
+    and downloads the signed stream via HlsDownloader, saving to
+    `Downloads/Mochi/` through MediaStore; step-specific failure
+    reporting (`no_title`, `feed_no_match`, `episode_number_unknown`,
+    `lookup_failed`, `play_failed`, `api_failed`, `hls_*`,
+    `save_failed`, `share_button_not_found`, …).
   - `BootReceiver.kt` — restores the overlay after a reboot if enabled.
 - `app/src/main/res/drawable/download_button.png` — the white download icon
   (512×512, downscaled from the 1934×1934 original). **Note:** this PNG is a
@@ -290,11 +359,52 @@ because the system share sheet can live in another package; the service
 filters in code and only scans other packages' windows during a
 user-started share flow.
 
+## Fixes (2026-11-19) — playback-time capture (download the video that is playing)
+
+Alex confirmed the overlay itself works but "the download is still flawed",
+and clarified the video IS downloadable at playback time (it plays like
+Instagram Reels, but there is a source when it plays). Root cause: the
+overlay constructed a bare Mux MP4 URL from a playback id — and that URL
+does not work for Mochi's signed playback ids (static MP4 is 404, and
+even with a signed token it is 403). The only working source is the signed
+HLS playlist Mochi's own player uses, and the overlay never fetched it.
+
+Fixed by resolving the playing video through Mochi's public read API
+(no login) and downloading the HLS stream itself:
+- `MochiApi.kt` (new): For You feed (each episode already carries its
+  signed playbackUrl), series search, episode lookup, and the /play
+  endpoint. Verified live with real episode ids; see the file header.
+- `HlsDownloader.kt` (new): fetches the signed master playlist, picks
+  the highest video rendition + the audio rendition, downloads the fMP4
+  segments in parallel, and remuxes them with MediaExtractor + MediaMuxer
+  into one .mp4 with audio and video. No ffmpeg, no root, no MITM.
+- `VideoDownloader.kt`: new resolution order — on-screen playback URL,
+  For You feed match, title search + lookup, on-screen episode id / watch
+  link, then the Share flow as fallback. The bare-Mux-URL download is
+  gone (it silently produced nothing). Files are saved to
+  `Downloads/Mochi/` via MediaStore. Failure codes are step-specific and
+  extended for the API path (`no_title`, `feed_no_match`,
+  `episode_number_unknown`, `lookup_failed`, `play_failed`, `api_failed`,
+  `hls_*`, `save_failed`, `mux_id_unresolved`).
+- `MochiAccessibilityService.kt` / `MochiState.kt`: the service now also
+  captures the creator handle (`@username`) and the episode number
+  ("Episode 5" / "Ep 5" / "E5") from the player UI, which the API
+  resolution needs to identify the playing episode. The watch-link
+  format was corrected to `mochi.tv/watch/<seriesSlug>/<episodeNumber>`
+  (two path segments); the old single-segment parse was wrong for it.
+- The two-step confirm flow, 51dp button, positioning, and all overlay
+  behaviour are unchanged.
+
 ## What this is NOT
 
 - It does not modify, re-sign, or patch the Mochi APK.
 - It does not bypass Play Integrity.
 - It does not MITM Mochi's traffic and does not install a CA certificate.
+  The stream URL comes from Mochi's public API, not from intercepting
+  traffic — and a plain VPN could not see it anyway, because the URL
+  path is inside HTTPS.
 - It does not navigate Mochi for Alex.
+- It does not screen-record (MediaProjection) as a substitute for
+  downloading the file.
 - It does not fake a download: if the video URL cannot be resolved, it says
   so instead of showing a fake success.

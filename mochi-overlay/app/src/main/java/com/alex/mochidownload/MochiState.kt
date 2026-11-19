@@ -18,10 +18,13 @@ import java.util.concurrent.TimeUnit
  * shifts (e.g. scrolling to the next video).
  *
  * Honest limit: an AccessibilityService can only read what Mochi puts on
- * screen (titles, labels, element bounds). The video's stream URL /
- * playbackId lives inside Mochi's own app state and is NOT shown in the
- * UI, so it is usually not here. That is why a tap cannot always resolve
- * a download — see [VideoDownloader] and README.md.
+ * screen (titles, creator names, episode numbers, element bounds). The
+ * video's stream URL / playbackId lives inside Mochi's own app state and
+ * is NOT shown in the UI, so it is usually not here. That is why the
+ * overlay resolves the playing video through Mochi's public API instead
+ * (see MochiApi / VideoDownloader): the on-screen title (+ creator +
+ * episode number) identifies the episode, and the API returns the signed
+ * playback URL. The Share flow remains as a fallback.
  *
  * Share flow: when Alex taps the overlay download button and no link is
  * already known, [VideoDownloader] asks the AccessibilityService to use
@@ -32,8 +35,16 @@ import java.util.concurrent.TimeUnit
 object MochiState {
     @Volatile var isMochiForeground: Boolean = false
     @Volatile var currentTitle: String? = null
+    @Volatile var currentCreator: String? = null
+    /** Episode number as shown in the player UI ("Episode 5", "Ep 5",
+     *  "E5"), if the player shows one. Null when it is not visible. */
+    @Volatile var currentEpisodeNumber: Int? = null
     @Volatile var currentWatchLink: String? = null
     @Volatile var currentPlaybackId: String? = null
+    /** A signed Mochi playback URL (.m3u8?token=...) if one is ever
+     *  visible on screen. Rarely present; the overlay normally resolves
+     *  it through the API instead. */
+    @Volatile var currentPlaybackUrl: String? = null
     @Volatile var lastTitleAtMs: Long = 0L
 
     // ----- UI anchor (action column in the video player) -----
@@ -129,8 +140,11 @@ object MochiState {
     fun reset() {
         isMochiForeground = false
         currentTitle = null
+        currentCreator = null
+        currentEpisodeNumber = null
         currentWatchLink = null
         currentPlaybackId = null
+        currentPlaybackUrl = null
         lastTitleAtMs = 0L
         clearAnchor()
         shareFlowActive = false
