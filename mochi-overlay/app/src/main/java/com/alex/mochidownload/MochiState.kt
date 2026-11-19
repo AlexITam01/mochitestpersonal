@@ -46,6 +46,10 @@ object MochiState {
      *  it through the API instead. */
     @Volatile var currentPlaybackUrl: String? = null
     @Volatile var lastTitleAtMs: Long = 0L
+    /** Set when the episode number changed: the next UI scan is a new
+     *  video, so the title/creator captured for the previous video are
+     *  stale and must be re-captured from scratch. */
+    @Volatile var pendingTitleReset: Boolean = false
 
     // ----- UI anchor (action column in the video player) -----
     // Bounds of the anchor element in screen pixels. Null when no anchor
@@ -82,6 +86,21 @@ object MochiState {
         anchorBottom = -1
         anchorLabel = null
         anchorAtMs = 0L
+    }
+
+    /** Clear the per-video identity (title, creator, links) but keep the
+     *  episode number, which is what signalled the video change.
+     *  Called at the start of the next UI scan after a video change, so
+     *  the scan re-captures the new video's title/creator from scratch
+     *  instead of keeping the previous video's (stale) ones. */
+    fun clearVideoIdentity() {
+        currentTitle = null
+        currentCreator = null
+        currentWatchLink = null
+        currentPlaybackId = null
+        currentPlaybackUrl = null
+        lastTitleAtMs = 0L
+        pendingTitleReset = false
     }
 
     // ----- Share-flow handshake (see class doc) -----
@@ -146,6 +165,7 @@ object MochiState {
         currentPlaybackId = null
         currentPlaybackUrl = null
         lastTitleAtMs = 0L
+        pendingTitleReset = false
         clearAnchor()
         shareFlowActive = false
         shareFlowResult = null

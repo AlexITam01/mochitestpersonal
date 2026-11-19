@@ -91,6 +91,9 @@ import java.net.URL
  *                          hls_segment_failed, hls_remux_failed)
  *  save_failed            — the .mp4 was built but could not be put
  *                          into Downloads/Mochi/
+ *  save_not_found         — the save reported success but the file is
+ *                          missing or 0 bytes in Downloads/Mochi/
+ *                          when checked afterwards
  *  a11y_not_enabled       — the Accessibility Service is off, so the
  *                          Share fallback cannot run
  *  share_button_not_found / share_sheet_timeout / no_share_option /
@@ -449,16 +452,29 @@ object VideoDownloader {
                         "Downloads/Mochi/. Check storage permission and try again.")
                 return
             }
+            // Verify the file actually landed and is non-empty before
+            // reporting "Saved": a MediaStore entry can exist while the
+            // bytes never made it (or were written as 0 bytes), and a
+            // "Saved" report for a file that is not there is worse than
+            // a failure — Alex cannot find it afterwards.
+            val savedBytes = savedFileSize(context, uri)
+            if (savedBytes == null || savedBytes <= 0) {
+                fail(context, "save_not_found",
+                    "The video was downloaded but the saved file could " +
+                        "not be found in Downloads/Mochi/ (or it is " +
+                        "empty). Check storage and try again.")
+                return
+            }
             val note = if (result.audioMissing) {
                 " (video only — no audio track was found in the stream)"
             } else ""
             finishDownload(context)
             postDownloadNotification(
                 context, "Mochi Download — saved",
-                "$fileName is in Downloads/Mochi/$note",
+                "$fileName is in Downloads/Mochi/ (${formatSize(savedBytes)})$note",
                 progress = null, ongoing = false
             )
-            toast(context, "Saved to Downloads/Mochi/$fileName$note")
+            toast(context, "Saved to Downloads/Mochi/$fileName (${formatSize(savedBytes)})$note")
         } finally {
             try { tmp.delete() } catch (e: Exception) { }
         }
@@ -537,6 +553,56 @@ object VideoDownloader {
         } catch (e: Exception) {
             null
         }
+    }
+
+    /** Bytes of the MediaStore entry at [uri], or null if it cannot be
+     *  read (entry missing). Used to verify a save really landed before
+     *  the app reports "Saved". For a file:// Uri (Android 9 fallback)
+     *  the file length is used instead. */
+    private fun savedFileSize(context: Context, uri: Uri): Long? {
+        if (uri.scheme == "file") {
+            return try {
+                val f = File(uri.path ?: return null)
+                if (f.exists()) f.length() else null
+            } catch (e: Exception) {
+                null
+            }
+        }
+        return try {
+            context.contentResolver.query(
+                uri, arrayOf(MediaStore.Downloads.SIZE), null, null, null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(MediaStore.Downloads.SIZE)
+                    if (idx >= 0) cursor.getLong(idx) else null
+                } else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun formatSize(bytes: Long): String {
+        return if (bytes >= 1_000_000) {
+            "%.1f MB".format(bytes / 1_000_000.0)
+        } else {
+            "%d KB".format(bytes / 1000)
+        }
+    }
+
+    /** What the overlay thinks is playing, for failure messages: when a
+     *  download fails because the video could not be identified, Alex
+     *  needs to see what the app actually saw on screen — a wrong or
+     *  stale title is the usual cause, and this names it instead of
+     *  leaving him guessing. */
+    private fun seenSummary(): String {
+        val title = MochiState.currentTitle
+        val creator = MochiState.currentCreator
+        val ep = MochiState.currentEpisodeNumber
+        return "On screen: " +
+            "title=" + (title?.let { "\"$it\"" } ?: "(none)") +
+            ", creator=" + (creator?.let { "@$it" } ?: "(none)") +
+            ", episode=" + (ep?.toString() ?: "(none)")
     }
 
     // ----- Share flow (fallback) -----
@@ -694,10 +760,20 @@ object VideoDownloader {
 
     /** Report a failure plainly: toast (short) + notification (exact step).
      *  Also ends the download state: the ongoing notification is cleared
-     *  and the button goes back from light blue to its normal look. */
+     *  and the button goes back from light blue to its normal look.
+     *  For resolution failures (the video could not be identified) the
+     *  notification also says what the app actually saw on screen, so a
+     *  wrong or stale title is visible instead of a bare code. */
     private fun fail(context: Context, code: String, message: String) {
         finishDownload(context)
-        showStatus(context, "Mochi Download — could not download [$code]", message)
+        val resolutionCodes = setOf(
+            "no_title", "feed_no_match", "feed_ambiguous",
+            "episode_number_unknown", "lookup_failed", "play_failed", "api_failed"
+        )
+        val fullMessage = if (code in resolutionCodes) {
+            "$message\n\n${seenSummary()}"
+        } else message
+        showStatus(context, "Mochi Download — could not download [$code]", fullMessage)
         toast(context, "Download failed: $code — see notification for details")
     }
 

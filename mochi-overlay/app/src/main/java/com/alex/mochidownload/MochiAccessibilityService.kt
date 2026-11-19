@@ -75,6 +75,10 @@ class MochiAccessibilityService : AccessibilityService() {
         private const val SHARE_FLOW_TIMEOUT_MS = 14000L
         private const val NATIVE_TOAST_WAIT_MS = 8000L
         private const val CLIPBOARD_READ_DELAY_MS = 900L
+        /** A captured title older than this is stale: Alex has moved on
+         *  to another video, so a fresh candidate may replace it even
+         *  when it is shorter (see scanTree). */
+        private const val TITLE_STALE_MS = 15000L
     }
 
     private data class AnchorCandidate(
@@ -196,6 +200,13 @@ class MochiAccessibilityService : AccessibilityService() {
                 val root = rootInActiveWindow ?: return
                 anchorCandidates.clear()
                 try {
+                    // The episode number changed on a previous scan: this
+                    // is a new video, so drop the previous video's
+                    // title/creator and re-capture them from this scan
+                    // instead of keeping the stale ones.
+                    if (MochiState.pendingTitleReset) {
+                        MochiState.clearVideoIdentity()
+                    }
                     scanTree(root)
                     if (MochiState.shareFlowActive) scanShareSheet(root)
                 } finally {
@@ -550,14 +561,28 @@ class MochiAccessibilityService : AccessibilityService() {
             // API resolution needs to identify the playing episode.
             // Only set them from a leaf node's own text, so a stray
             // "@someone" in a comment does not overwrite the creator.
-            if (node.childCount == 0 && !text.isNullOrBlank()) {
-                CREATOR_HANDLE.find(text)?.let {
-                    MochiState.currentCreator = it.groupValues[1]
-                }
-                EPISODE_NUMBER.find(text)?.let {
-                    val num = it.groupValues[1].ifEmpty { it.groupValues[2] }
-                    num.toIntOrNull()?.let { n ->
-                        MochiState.currentEpisodeNumber = n
+            // Both the text and the content description are checked:
+            // Mochi sometimes puts the episode label in the description.
+            if (node.childCount == 0) {
+                for (candidate in listOf(text, desc)) {
+                    if (candidate.isNullOrBlank()) continue
+                    CREATOR_HANDLE.find(candidate)?.let {
+                        MochiState.currentCreator = it.groupValues[1]
+                    }
+                    EPISODE_NUMBER.find(candidate)?.let {
+                        val num = it.groupValues[1].ifEmpty { it.groupValues[2] }
+                        num.toIntOrNull()?.let { n ->
+                            val prev = MochiState.currentEpisodeNumber
+                            if (prev != null && prev != n) {
+                                // New video (episode number changed): the
+                                // title/creator captured for the old video
+                                // are stale. Flag a re-capture on the
+                                // next scan; the episode number itself is
+                                // kept, since it is what signalled this.
+                                MochiState.pendingTitleReset = true
+                            }
+                            MochiState.currentEpisodeNumber = n
+                        }
                     }
                 }
             }
@@ -565,13 +590,26 @@ class MochiAccessibilityService : AccessibilityService() {
         // Heuristic for the video title: the longest non-empty text on a
         // leaf node. Titles are usually the most prominent text on the
         // player screen. This is best-effort, not exact.
+        //
+        // Staleness rule (fix for "worked for a few episodes then
+        // stopped"): the old rule only ever replaced the title with a
+        // LONGER text, so once a long description/comment was captured,
+        // the real (shorter) series title could never take over — and
+        // across videos the previous video's title stuck around whenever
+        // the new video's title was shorter. Now a new candidate also
+        // replaces the current title when the current title is stale
+        // (> TITLE_STALE_MS old, i.e. Alex has moved on to another
+        // video), so a fresh video's title wins. Within one video's
+        // first seconds the longest text still wins.
         if (node.childCount == 0 && !text.isNullOrBlank()) {
             val t = text.trim()
             val prev = MochiState.currentTitle
             if (t.length >= 4 && t.length <= 160 && t != prev) {
-                if (prev == null || t.length > prev.length) {
+                val now = System.currentTimeMillis()
+                val stale = now - MochiState.lastTitleAtMs > TITLE_STALE_MS
+                if (prev == null || stale || t.length > prev.length) {
                     MochiState.currentTitle = t
-                    MochiState.lastTitleAtMs = System.currentTimeMillis()
+                    MochiState.lastTitleAtMs = now
                 }
             }
         }

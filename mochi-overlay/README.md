@@ -447,6 +447,65 @@ Visible feedback added (Alex's explicit asks):
 The two-step confirm flow, positioning, 51dp size, and all download
 methods are unchanged.
 
+## Fixes (2026-11-19) — downloads stop after a few episodes (v6)
+
+Alex downloaded a few episodes fine, then downloads stopped working —
+he suspected "mochi might have changed streams". **Live verification
+2026-11-19 says Mochi did NOT change the stream:** the For You feed,
+search, lookup-episode and /play endpoints all still return HTTP 200
+with the same fields; the signed `.m3u8` is still an HLS master playlist
+(4 video renditions 1080/720/480/270 + a separate audio rendition);
+rendition playlists are still fMP4 (init segment + ~5s `.m4s` segments,
+no encryption); the segments still download and are still video-only
+h264 + audio-only aac. No rate limiting was seen (5 rapid feed requests,
+all 200), and the signed tokens last ~19 hours, so a download that
+starts right after a tap is not expiring mid-flight.
+
+The actual cause is the **guest For You feed only returns the first
+page: 5 episodes, all episode 1**. The first few downloads were almost
+certainly feed matches. Once Alex moved to episode 2+ of a series, or
+to a series not in the feed, the app depends on the on-screen title +
+episode number from the AccessibilityService — and the title capture had
+a real defect: the old rule only ever replaced the title with a LONGER
+text, so once a long description/comment was captured, the real
+(shorter) series title could never take over, and across videos the
+previous video's title stuck around whenever the new video's title was
+shorter. A stale/wrong title makes the feed match and the search both
+miss, and without an episode number the search + lookup path cannot run
+either — so those videos depend entirely on the Share-flow fallback.
+
+Fixes in this build:
+- **Title staleness:** a new title candidate now also replaces the
+  current title when the current title is stale (> 15s old, i.e. Alex
+  has moved on to another video), so a fresh video's title wins even
+  when it is shorter. Within one video's first seconds the longest
+  text still wins.
+- **Video-change reset:** when the episode number changes (a new video),
+  the title/creator/links from the previous video are dropped and
+  re-captured from the next UI scan, so a swipe to a new episode does
+  not keep resolving the old one.
+- **Episode/creator capture:** the episode number and creator handle are
+  now also read from a node's content description, not only its text —
+  Mochi sometimes puts the episode label there.
+- **Failure messages name what the app saw:** resolution failures
+  (`no_title`, `feed_no_match`, `episode_number_unknown`,
+  `lookup_failed`, `play_failed`, `api_failed`) now include an
+  "On screen: title=…, creator=…, episode=…" line in the notification,
+  so a wrong or stale title is visible instead of a bare code.
+- **Save verification:** after writing to Downloads/Mochi/ the app now
+  checks the saved file actually exists and is non-empty before
+  reporting "Saved" (new code `save_not_found` if it is missing or
+  0 bytes), and the success notification now shows the file size.
+  (The "missing files" Alex reported turned out to be files he moved
+  himself afterwards — the save itself was correct — but the check
+  means a "Saved" report can now be trusted.)
+
+The two-step confirm flow, positioning, 51dp size, light-blue
+downloading state, progress notification, and all download methods are
+unchanged. If a download still fails, the notification now says both
+the step code and what the app thought was playing — that is the
+diagnostic to report back.
+
 ## What this is NOT
 
 - It does not modify, re-sign, or patch the Mochi APK.
