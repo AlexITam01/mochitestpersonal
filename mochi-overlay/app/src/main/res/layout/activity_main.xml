@@ -79,6 +79,13 @@
         android:text="@string/enable_a11y" />
 
     <Button
+        android:id="@+id/notif_perm_button"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="@string/grant_notifications" />
+
+    <Button
         android:id="@+id/how_button"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

@@ -3,6 +3,7 @@ package com.alex.mochidownload
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.usage.UsageStatsManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -105,6 +106,10 @@ import java.net.URL
 object VideoDownloader {
 
     private const val NOTIF_CHANNEL = "mochi_download_status"
+    /** Fixed id of the ongoing download notification, so progress
+     *  updates replace it in place instead of stacking new ones. */
+    private const val NOTIF_DOWNLOAD_ID = 100
+    private const val MOCHI_PACKAGE = "com.mochitv.mochi"
     private const val SHARE_FLOW_WAIT_MS = 16000L
     private val WATCH_LINK_TWO_PART =
         Regex("mochi\\.tv/watch/([A-Za-z0-9_-]+)/(\\d+)")
@@ -125,7 +130,18 @@ object VideoDownloader {
     }
 
     fun onDownloadTapped(context: Context) {
-        if (!MochiState.isMochiForeground) {
+        // Immediate, visible feedback FIRST, before any slow work: the
+        // button turns light blue (OverlayService) and a persistent
+        // notification appears, so a tap is never silent — even if the
+        // download then fails, the failure replaces this notification
+        // with the exact step code.
+        OverlayService.notifyDownloadStarted(context)
+        postDownloadNotification(
+            context, "Mochi Download — downloading…",
+            "Finding the video playing in Mochi…",
+            progress = -1, ongoing = true
+        )
+        if (!isMochiForegroundNow(context)) {
             fail(context, "mochi_not_foreground",
                 "Mochi does not seem to be open in front right now, so " +
                     "there is no video to download. Open the video in Mochi " +
@@ -152,6 +168,47 @@ object VideoDownloader {
                 }
             }
         }.start()
+    }
+
+    /**
+     * Is Mochi the app in front right now? Two signals, and the same
+     * "never decide on unknown" rule as the overlay's visibility poll:
+     *  - MochiState.isMochiForeground (AccessibilityService window events).
+     *  - UsageStats foreground events (needs Usage access).
+     * Only returns false when UsageStats positively reports a DIFFERENT
+     * app in front. When both signals are unknown, the tap is allowed
+     * through — the button is only visible while Mochi is on screen, so
+     * a tap on it is itself evidence a video is playing, and the
+     * resolution step will fail with a proper code (no_title) if there
+     * is genuinely no video to identify.
+     *
+     * The old code failed fast on MochiState alone, which is only ever
+     * set by the AccessibilityService — so with that service off or
+     * stale, every tap died silently with mochi_not_foreground. */
+    private fun isMochiForegroundNow(context: Context): Boolean {
+        if (MochiState.isMochiForeground) return true
+        val usm = context.getSystemService(Context.USAGE_STATS_SERVICE)
+            as? UsageStatsManager ?: return true
+        val now = System.currentTimeMillis()
+        val events = try {
+            usm.queryEvents(now - 3600000L, now)
+        } catch (e: Exception) {
+            return true
+        } ?: return true
+        val event = android.app.usage.UsageEvents.Event()
+        var foreground: String? = null
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event)
+            when (event.eventType) {
+                android.app.usage.UsageEvents.Event.MOVE_TO_FOREGROUND ->
+                    foreground = event.packageName
+                android.app.usage.UsageEvents.Event.MOVE_TO_BACKGROUND -> {
+                    if (foreground == event.packageName) foreground = null
+                }
+            }
+        }
+        // Null = unknown: allow the tap. A different package = blocked.
+        return foreground == null || foreground == MOCHI_PACKAGE
     }
 
     // ----- API resolution (no tapping inside Mochi) -----
@@ -356,6 +413,10 @@ object VideoDownloader {
         playbackUrl: String,
         fileName: String
     ) {
+        postDownloadNotification(
+            context, "Downloading $fileName",
+            "Downloading the video…", progress = 0, ongoing = true
+        )
         toast(context, "Downloading $fileName…")
         val tmp = File(context.cacheDir, "mochi_dl_${System.currentTimeMillis()}.mp4")
         try {
@@ -363,7 +424,13 @@ object VideoDownloader {
                 HlsDownloader.download(
                     playbackUrl = playbackUrl,
                     outFile = tmp,
-                    onProgress = { _ -> /* best-effort; the completion toast is what Alex acts on */ }
+                    onProgress = { p ->
+                        postDownloadNotification(
+                            context, "Downloading $fileName",
+                            "Downloading the video… $p%",
+                            progress = p, ongoing = true
+                        )
+                    }
                 )
             } else {
                 downloadDirectFile(playbackUrl, tmp)
@@ -385,9 +452,11 @@ object VideoDownloader {
             val note = if (result.audioMissing) {
                 " (video only — no audio track was found in the stream)"
             } else ""
-            showStatus(
+            finishDownload(context)
+            postDownloadNotification(
                 context, "Mochi Download — saved",
-                "$fileName is in Downloads/Mochi/$note"
+                "$fileName is in Downloads/Mochi/$note",
+                progress = null, ongoing = false
             )
             toast(context, "Saved to Downloads/Mochi/$fileName$note")
         } finally {
@@ -481,13 +550,18 @@ object VideoDownloader {
                     "Turn it on in Mochi Download's setup screen, then tap again.")
             return
         }
-        if (!MochiState.isMochiForeground) {
+        if (!isMochiForegroundNow(context)) {
             fail(context, "mochi_not_foreground",
                 "Mochi does not seem to be open in front right now, so " +
                     "there is no video to download. Open the video in Mochi " +
                     "and tap the button again.")
             return
         }
+        postDownloadNotification(
+            context, "Mochi Download — downloading…",
+            "Opening Mochi's Share menu to get the video link…",
+            progress = -1, ongoing = true
+        )
         toast(context, "Opening Mochi's Share menu to get the video link…")
         val intent = Intent(context, MochiAccessibilityService::class.java).apply {
             action = MochiAccessibilityService.ACTION_REQUEST_SHARE_TAP
@@ -520,7 +594,11 @@ object VideoDownloader {
                     } else {
                         "Mochi says: \"$detail\""
                     }
-                    showStatus(context, "Mochi Download — saved by Mochi", msg)
+                    finishDownload(context)
+                    postDownloadNotification(
+                        context, "Mochi Download — saved by Mochi", msg,
+                        progress = null, ongoing = false
+                    )
                     toast(context, msg)
                 }
             }
@@ -614,10 +692,67 @@ object VideoDownloader {
         }
     }
 
-    /** Report a failure plainly: toast (short) + notification (exact step). */
+    /** Report a failure plainly: toast (short) + notification (exact step).
+     *  Also ends the download state: the ongoing notification is cleared
+     *  and the button goes back from light blue to its normal look. */
     private fun fail(context: Context, code: String, message: String) {
+        finishDownload(context)
         showStatus(context, "Mochi Download — could not download [$code]", message)
         toast(context, "Download failed: $code — see notification for details")
+    }
+
+    /** End the download state: clear the light-blue button and drop the
+     *  ongoing "downloading" notification (a final notification, if
+     *  any, is posted separately by the caller). */
+    private fun finishDownload(context: Context) {
+        try {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE)
+                as NotificationManager
+            nm.cancel(NOTIF_DOWNLOAD_ID)
+        } catch (e: Exception) { }
+        OverlayService.notifyDownloadFinished(context)
+    }
+
+    /**
+     * The persistent download alert (Alex asked for this): one
+     * notification, id NOTIF_DOWNLOAD_ID, that appears the moment a
+     * download starts, shows progress while it runs, and is replaced in
+     * place by the saved/failed result. [progress] is 0..100, -1 for an
+     * indeterminate spinner, null for no progress bar (a finished
+     * notification). Unlike the old code, which only showed a transient
+     * toast, this stays in the shade until the download ends.
+     *
+     * NOTE: on Android 13+ this is silently dropped unless the
+     * POST_NOTIFICATIONS runtime permission is granted — MainActivity
+     * now requests it on first launch. */
+    private fun postDownloadNotification(
+        context: Context,
+        title: String,
+        body: String,
+        progress: Int?,
+        ongoing: Boolean
+    ) {
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(
+                NOTIF_CHANNEL, "Mochi Download status",
+                NotificationManager.IMPORTANCE_DEFAULT
+            )
+            nm.createNotificationChannel(ch)
+        }
+        val builder = Notification.Builder(context, NOTIF_CHANNEL)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(Notification.BigTextStyle().bigText(body))
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setOngoing(ongoing)
+            .setAutoCancel(!ongoing)
+        when (progress) {
+            null -> { /* no progress bar */ }
+            -1 -> builder.setProgress(0, 0, true)
+            else -> builder.setProgress(100, progress.coerceIn(0, 100), false)
+        }
+        try { nm.notify(NOTIF_DOWNLOAD_ID, builder.build()) } catch (e: Exception) { }
     }
 
     private fun toast(context: Context, msg: String) {

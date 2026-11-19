@@ -56,7 +56,16 @@ import android.widget.Toast
  *    his behalf to get the video link.
  * 5. Tap the LOCKED button to download the video Mochi is currently
  *    playing, saved to the device's Downloads folder (see VideoDownloader
- *    for how the link is resolved).
+ *    for how the link is resolved). A tap ALWAYS does something visible:
+ *    the button turns light blue the moment it is pressed and stays light
+ *    blue while the download runs, and a persistent notification shows
+ *    the download progress. A tap is never silently swallowed — a locked
+ *    button cannot be dragged, so any release on it counts as a tap
+ *    (the old `moved` check ate taps whose finger drifted a few pixels).
+ *
+ * The button's look: positioning = dashed outline; placed but not
+ * confirmed = dashed outline, dimmed; locked = plain, full opacity;
+ * pressed / downloading = LIGHT BLUE.
  *
  * Suckerfish anchoring: where Mochi's player action column (like / comment
  * / share) is visible, the button latches onto it — it sits just below the
@@ -77,6 +86,14 @@ class OverlayService : Service() {
         const val ACTION_STOP = "com.alex.mochidownload.ACTION_STOP"
         const val ACTION_CONFIRM = "com.alex.mochidownload.ACTION_CONFIRM"
         const val ACTION_REPOSITION = "com.alex.mochidownload.ACTION_REPOSITION"
+        /** The download button was tapped and a download is starting. */
+        const val ACTION_DOWNLOAD_STARTED =
+            "com.alex.mochidownload.ACTION_DOWNLOAD_STARTED"
+        /** The download finished (saved) or failed: clear the blue state. */
+        const val ACTION_DOWNLOAD_FINISHED =
+            "com.alex.mochidownload.ACTION_DOWNLOAD_FINISHED"
+        /** Light blue the button turns while pressed / downloading. */
+        val LIGHT_BLUE = 0xFF87CEEB.toInt()
         const val PREFS = "mochi_overlay"
         const val KEY_X = "pos_x"
         const val KEY_Y = "pos_y"
@@ -115,6 +132,32 @@ class OverlayService : Service() {
             }
         }
 
+        /** VideoDownloader: a download just started — turn the button
+         *  light blue while it runs. */
+        fun notifyDownloadStarted(context: Context) {
+            val intent = Intent(context, OverlayService::class.java).apply {
+                action = ACTION_DOWNLOAD_STARTED
+            }
+            try {
+                context.startForegroundService(intent)
+            } catch (e: Exception) {
+                try { context.startService(intent) } catch (e2: Exception) { }
+            }
+        }
+
+        /** VideoDownloader: the download ended (saved or failed) — the
+         *  button goes back to its normal locked look. */
+        fun notifyDownloadFinished(context: Context) {
+            val intent = Intent(context, OverlayService::class.java).apply {
+                action = ACTION_DOWNLOAD_FINISHED
+            }
+            try {
+                context.startForegroundService(intent)
+            } catch (e: Exception) {
+                try { context.startService(intent) } catch (e2: Exception) { }
+            }
+        }
+
         const val MOCHI_PACKAGE = "com.mochitv.mochi"
         private const val NOTIF_CHANNEL = "mochi_overlay"
         private const val NOTIF_ID = 1
@@ -133,6 +176,10 @@ class OverlayService : Service() {
     private var buttonVisible = false
     private var editMode = false
     private var buttonSizePx = 0
+    /** A download is running: the button stays light blue until it ends. */
+    private var downloading = false
+    /** The button is being pressed right now: light blue until release. */
+    private var pressTint = false
 
     // Last anchor bounds the button was positioned against, so we can tell
     // when the layout shifted and re-anchor.
@@ -169,6 +216,20 @@ class OverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_DOWNLOAD_STARTED) {
+            // A download just started: light blue until it ends.
+            downloading = true
+            pressTint = false
+            applyButtonState()
+            return START_STICKY
+        }
+        if (intent?.action == ACTION_DOWNLOAD_FINISHED) {
+            // Saved or failed: back to the normal locked look.
+            downloading = false
+            pressTint = false
+            applyButtonState()
+            return START_STICKY
+        }
         if (intent?.action == ACTION_STOP) {
             stopOverlay()
             stopSelf()
@@ -456,6 +517,9 @@ class OverlayService : Service() {
 
     /**
      * The button's look tells Alex which state it is in:
+     *  - downloading (or being pressed): LIGHT BLUE — the button turns
+     *    light blue the moment it is pressed and stays light blue while
+     *    the download runs, then goes back to normal when it ends.
      *  - positioning (edit mode): dashed outline, slightly dimmed — draggable.
      *  - placed but NOT confirmed: dashed outline, more dimmed — it is not
      *    a download button yet; tap only reminds him to confirm in the app.
@@ -464,15 +528,23 @@ class OverlayService : Service() {
     private fun applyButtonState() {
         val b = button ?: return
         when {
+            downloading || pressTint -> {
+                b.setBackgroundResource(0)
+                b.setColorFilter(LIGHT_BLUE, android.graphics.PorterDuff.Mode.SRC_ATOP)
+                b.alpha = 1.0f
+            }
             editMode -> {
+                b.clearColorFilter()
                 b.setBackgroundResource(R.drawable.button_edit_outline)
                 b.alpha = 0.85f
             }
             !isConfirmed() -> {
+                b.clearColorFilter()
                 b.setBackgroundResource(R.drawable.button_edit_outline)
                 b.alpha = 0.6f
             }
             else -> {
+                b.clearColorFilter()
                 b.setBackgroundResource(0)
                 b.alpha = 1.0f
             }
@@ -483,6 +555,7 @@ class OverlayService : Service() {
         if (button == null || editMode) return
         if (isConfirmed()) return // Locked: long-press does nothing.
         editMode = true
+        pressTint = false
         applyButtonState()
         Toast.makeText(this, "Move the button, then release to place it",
             Toast.LENGTH_SHORT).show()
@@ -514,6 +587,12 @@ class OverlayService : Service() {
                 downParamY = lp.y
                 moved = false
                 handler.removeCallbacks(longPressRunnable)
+                // Instant press feedback: the button turns light blue the
+                // moment a finger lands on it, so a tap is never silent.
+                if (!editMode && !downloading) {
+                    pressTint = true
+                    applyButtonState()
+                }
                 // A locked button cannot be dragged: no long-press.
                 if (!isConfirmed()) {
                     handler.postDelayed(longPressRunnable, LONG_PRESS_MS)
@@ -536,32 +615,37 @@ class OverlayService : Service() {
             }
             MotionEvent.ACTION_UP -> {
                 handler.removeCallbacks(longPressRunnable)
-                if (!moved) {
-                    // A tap.
-                    if (editMode) {
-                        // Tap while positioning: place the spot (pending).
-                        exitEditModeAndSave()
-                    } else if (isConfirmed()) {
-                        // Tap on the LOCKED button = download the video.
-                        VideoDownloader.onDownloadTapped(this)
-                    } else {
-                        // Placed but not confirmed yet: not a download
-                        // button. Point Alex at the confirm step.
-                        Toast.makeText(this,
-                            "Position not confirmed yet — open Mochi " +
-                                "Download and press \"Lock position\".",
-                            Toast.LENGTH_LONG).show()
-                    }
-                } else if (editMode) {
-                    // Released after a drag in positioning mode: the spot
-                    // is recorded and persisted as PENDING — no auto-lock.
-                    // Alex confirms it in the app.
+                if (editMode) {
+                    // Release in positioning mode: place the spot (drag
+                    // or tap) — recorded as PENDING, no auto-lock.
+                    pressTint = false
                     exitEditModeAndSave()
+                } else if (isConfirmed()) {
+                    // Tap on the LOCKED button = download the video.
+                    //
+                    // NOTE: there is deliberately NO `moved` check here.
+                    // The old code required !moved, which silently
+                    // swallowed any tap whose finger drifted more than
+                    // 12px — the most common way a tap on a small button
+                    // produces nothing at all. A locked button cannot be
+                    // dragged, so any release on it is a tap.
+                    VideoDownloader.onDownloadTapped(this)
+                } else {
+                    // Placed but not confirmed yet: not a download
+                    // button. Point Alex at the confirm step.
+                    pressTint = false
+                    applyButtonState()
+                    Toast.makeText(this,
+                        "Position not confirmed yet — open Mochi " +
+                            "Download and press \"Lock position\".",
+                        Toast.LENGTH_LONG).show()
                 }
                 true
             }
             MotionEvent.ACTION_CANCEL -> {
                 handler.removeCallbacks(longPressRunnable)
+                pressTint = false
+                applyButtonState()
                 true
             }
             else -> false

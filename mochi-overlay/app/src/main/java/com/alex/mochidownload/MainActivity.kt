@@ -4,7 +4,9 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -50,6 +52,7 @@ class MainActivity : Activity() {
         val overlayPermButton: Button = findViewById(R.id.overlay_perm_button)
         val usagePermButton: Button = findViewById(R.id.usage_perm_button)
         val a11yButton: Button = findViewById(R.id.a11y_button)
+        val notifButton: Button = findViewById(R.id.notif_perm_button)
         val howButton: Button = findViewById(R.id.how_button)
 
         toggleButton.setOnClickListener { toggleOverlay() }
@@ -65,6 +68,13 @@ class MainActivity : Activity() {
         a11yButton.setOnClickListener {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
+        notifButton.setOnClickListener { requestNotificationPermission() }
+        // Download alerts (started / saved / failed with the step code)
+        // are real notifications. On Android 13+ they are silently
+        // dropped unless this runtime permission is granted — the old
+        // build declared it in the manifest but never asked for it, so
+        // a tap could fail with no alert at all. Ask on first launch.
+        requestNotificationPermission()
         howButton.setOnClickListener {
             Toast.makeText(this,
                 "1. Long-press the floating button in Mochi and drag it " +
@@ -155,10 +165,50 @@ class MainActivity : Activity() {
         return enabled.any { it.resolveInfo.serviceInfo.packageName == packageName }
     }
 
+    /** Android 13+: download alerts are real notifications, and the
+     *  system silently drops them without this runtime grant. If the
+     *  user denied it before, Android will not show the prompt again —
+     *  in that case open the app's notification settings instead. */
+    private fun isNotificationsGranted(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
+        return checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (isNotificationsGranted()) {
+            Toast.makeText(this, "Notifications already allowed.",
+                Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (shouldShowRequestPermissionRationale(
+                android.Manifest.permission.POST_NOTIFICATIONS)
+        ) {
+            requestPermissions(
+                arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1001
+            )
+        } else {
+            // First ask, or "don't ask again" was ticked: try the prompt
+            // once; if the system refuses to show it, the user can allow
+            // it from the app settings screen instead.
+            try {
+                requestPermissions(
+                    arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1001
+                )
+            } catch (e: Exception) {
+                startActivity(Intent(
+                    Settings.ACTION_APP_NOTIFICATION_SETTINGS
+                ).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
+            }
+        }
+    }
+
     private fun refreshStatus() {
         val overlayOk = Settings.canDrawOverlays(this)
         val usageOk = isUsageAccessGranted()
         val a11yOk = isAccessibilityEnabled()
+        val notifOk = isNotificationsGranted()
         val running = isOverlayRunning()
         val title = MochiState.currentTitle
         val sb = StringBuilder()
@@ -166,11 +216,14 @@ class MainActivity : Activity() {
         sb.append("Draw over apps: ").append(if (overlayOk) "granted" else "NOT granted").append("\n")
         sb.append("Usage access: ").append(if (usageOk) "granted" else "NOT granted").append("\n")
         sb.append("Accessibility service: ").append(if (a11yOk) "on" else "OFF").append("\n")
+        sb.append("Notifications: ").append(
+            if (notifOk) "granted" else "NOT granted — download alerts will not show"
+        ).append("\n")
         sb.append("Mochi in foreground: ")
             .append(if (MochiState.isMochiForeground) "yes" else "no").append("\n")
         if (!title.isNullOrBlank()) sb.append("Now playing: ").append(title).append("\n")
-        if (!overlayOk || !usageOk || !a11yOk) {
-            sb.append("\nGrant the three items above, then start the overlay.")
+        if (!overlayOk || !usageOk || !a11yOk || !notifOk) {
+            sb.append("\nGrant the items above, then start the overlay.")
         }
         statusText.text = sb.toString()
         toggleButton.text = if (running) "Stop overlay" else "Start overlay"

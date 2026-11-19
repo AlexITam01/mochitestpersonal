@@ -88,13 +88,16 @@ cannot literally become part of Mochi's view hierarchy (that would require
 modifying Mochi). It *looks* native because it sits next to Mochi's own
 buttons and moves with them, but it is a separate window on top.
 
-## Setup (all three are granted by Alex in Settings)
+## Setup (granted by Alex; the app asks for notifications itself)
 
 1. **"Draw over other apps"** — lets the button sit on Mochi.
 2. **"Usage access"** — lets the app tell when Mochi is in the foreground.
 3. **Accessibility Service ("Mochi Download")** — lets the app read the
    video title and find the action-column anchor (and wake the overlay when
    Mochi opens).
+4. **Notifications** — the app asks for this itself on first launch
+   (Android 13+). Without it, download alerts are silently dropped by
+   the system and a tap can fail with no visible notice at all.
 
 The MainActivity has a button for each and a live status readout.
 
@@ -394,6 +397,55 @@ Fixed by resolving the playing video through Mochi's public read API
   (two path segments); the old single-segment parse was wrong for it.
 - The two-step confirm flow, 51dp button, positioning, and all overlay
   behaviour are unchanged.
+
+## Fixes (2026-11-19) — tap does nothing + no indication (v5)
+
+Alex tapped the locked button while a video was playing and got nothing:
+no colour change, no download alert, nothing. Three separate defects
+combined to make a tap completely silent:
+
+1. **Tap swallowed by the `moved` flag.** The touch handler only counted
+   a release as a tap when the finger had not drifted more than 12px.
+   One-handed taps on a 51dp button drift past that easily — and when
+   `moved` was true and the button was not in edit mode, `ACTION_UP`
+   did literally nothing: no download, no toast, no feedback. Fixed:
+   a locked button cannot be dragged, so ANY release on it now counts
+   as a tap (the `moved` check is gone for the tap path; movement only
+   matters while positioning).
+2. **Notifications silently dropped.** The manifest declared
+   `POST_NOTIFICATIONS`, but the app never requested it at runtime. On
+   Android 13+ every download/failure notification was discarded by the
+   system — only the foreground-service notice (exempt) ever showed.
+   Fixed: MainActivity now requests the permission on first launch and
+   shows its state on the setup screen, with a "4. Allow notifications"
+   button to re-ask.
+3. **Foreground gate too strict.** `onDownloadTapped` failed fast when
+   `MochiState.isMochiForeground` was false — but that flag is only set
+   by the AccessibilityService, so with that service off or stale every
+   tap died with `mochi_not_foreground`, and its only feedback was a
+   toast plus a notification that defect 2 dropped. Fixed: the gate now
+   also checks UsageStats foreground events, and only blocks when a
+   DIFFERENT app is positively known to be in front — unknown means the
+   tap goes through (the button is only visible over Mochi, so a tap on
+   it is itself evidence a video is playing).
+
+Visible feedback added (Alex's explicit asks):
+- **Light blue button:** the button turns light blue the moment it is
+  pressed and stays light blue while the download runs, then returns to
+  its normal locked look when the download ends (saved or failed).
+  States are now: positioning = dashed outline, placed-not-confirmed =
+  dashed outline + dimmed, locked = plain full opacity, pressed /
+  downloading = light blue.
+- **Download-in-progress alert:** a persistent notification appears the
+  moment a tap is accepted ("Downloading…"), shows the file name and a
+  progress bar while the HLS segments download, and is replaced in
+  place by "Saved to Downloads/Mochi/…" or by a failure notification
+  naming the exact step code. A toast alone is no longer the only
+  signal. The `HlsDownloader.onProgress` callback, previously ignored,
+  now drives the progress bar.
+
+The two-step confirm flow, positioning, 51dp size, and all download
+methods are unchanged.
 
 ## What this is NOT
 
