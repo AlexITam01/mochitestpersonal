@@ -552,6 +552,43 @@ Fixes in this build:
   that is why Alex saw "nothing afterwards". `fail()` now appends the
   summary to every failure notification, whatever the step code.
 
+## Images (2026-11-20) — poster + episode stills (v8)
+
+Hold the locked button (~1 second) to download the IMAGES for the
+series showing in Mochi, instead of the video. Tap still downloads
+the video; a hold downloads the images and a release after a hold
+does NOT also start a video download.
+
+What it downloads (all from Mochi's public read API, no login):
+- The series poster: the series' cover art
+  (`thumbnailUrl`, mochi.imgix.net/ugc/series-posters/...), requested
+  at w=1200 so the saved poster is sharper than the on-screen one.
+- One still per episode: each episode's `thumbnailUrl`
+  (image.mux.com/.../thumbnail.jpg, signed with a token). These are
+  the character art — the stills of the characters in each episode.
+  The token is used exactly as returned; the stills are downloaded in
+  the same run because the token expires.
+
+Saved to `Downloads/Mochi/<Series Title>/`:
+`<Series Title> - poster.png` and `<Series Title> - E<n>.jpg`
+(one per episode that has a thumbnail). Each file is verified
+non-empty before it counts as saved, the same as videos.
+
+How the series is found: the on-screen title is matched against the
+For You feed (which carries the seriesId) or, failing that, title
+search, then the series detail endpoint
+(`GET /api/mobile/series/<seriesId>`) returns the poster and every
+episode's thumbnail. There is no dedicated "character art" field in
+the API — the episode stills are the character images the API
+exposes. The creator's profile picture (`pfpUrl`) is NOT downloaded.
+
+The hold is a separate gesture from the tap on purpose: the tap path
+is untouched (the v5 fix that made taps reliable is preserved), and
+a hold only fires when the finger stays down past 800ms without
+moving — a drag cancels it, and releasing after a hold does nothing
+extra. The button turns light blue while the images download, the
+same as a video download.
+
 ## What this is NOT
 
 - It does not modify, re-sign, or patch the Mochi APK.

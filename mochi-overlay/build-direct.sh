@@ -35,8 +35,8 @@ done
     -I "$PLATFORM" \
     --manifest "$ROOT/app/src/main/AndroidManifest.xml" \
     --java "$WORK/generated" \
-    --version-code 1 \
-    --version-name "1.0" \
+    --version-code 8 \
+    --version-name "8.0" \
     --auto-add-overlay \
     "$WORK/compiled-res"/*.flat
 

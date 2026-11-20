@@ -220,6 +220,60 @@ object MochiApi {
         }
     }
 
+    /** One episode thumbnail from a series detail. */
+    data class EpisodeThumb(
+        val number: Int,
+        val thumbnailUrl: String?
+    )
+
+    /** A series' poster + its episodes' thumbnails, from the series
+     *  detail endpoint. The poster is the series' cover art
+     *  (mochi.imgix.net/ugc/series-posters/...); the episode
+     *  thumbnails are the per-episode stills (image.mux.com/...
+     *  /thumbnail.jpg, signed with a token) — the character art. */
+    data class SeriesDetail(
+        val id: String,
+        val slug: String,
+        val title: String,
+        val posterUrl: String?,
+        val episodes: List<EpisodeThumb>
+    )
+
+    /** Full series detail: poster + every episode's thumbnail.
+     *  GET /api/mobile/series/<seriesId> (the slug 404s; the id works).
+     *  Null if the series is not found or the call fails. */
+    fun fetchSeriesDetail(seriesId: String): SeriesDetail? {
+        val text = getText("$BASE/series/$seriesId") ?: return null
+        return try {
+            val data = JSONObject(text).optJSONObject("data") ?: return null
+            val id = data.optString("id", "")
+            val title = data.optString("title", "")
+            if (id.isEmpty() || title.isEmpty()) return null
+            val eps = ArrayList<EpisodeThumb>()
+            val arr: JSONArray = data.optJSONArray("episodes") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                val e = arr.optJSONObject(i) ?: continue
+                eps.add(
+                    EpisodeThumb(
+                        number = e.optInt("number", 0),
+                        thumbnailUrl = e.optString("thumbnailUrl", "")
+                            .takeIf { it.isNotEmpty() }
+                    )
+                )
+            }
+            SeriesDetail(
+                id = id,
+                slug = data.optString("slug", ""),
+                title = title,
+                posterUrl = data.optString("thumbnailUrl", "")
+                    .takeIf { it.isNotEmpty() },
+                episodes = eps
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     /** Full episode object for one id (same shape as a feed episode).
      *  Null if not found. */
     fun fetchForYouEpisode(episodeId: String): FeedEpisode? {

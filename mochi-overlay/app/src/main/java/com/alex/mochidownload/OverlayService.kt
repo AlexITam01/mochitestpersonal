@@ -56,12 +56,17 @@ import android.widget.Toast
  *    his behalf to get the video link.
  * 5. Tap the LOCKED button to download the video Mochi is currently
  *    playing, saved to the device's Downloads folder (see VideoDownloader
- *    for how the link is resolved). A tap ALWAYS does something visible:
+ *    for how the link is resolved). HOLD the locked button (~1s) to
+ *    download the IMAGES instead: the series poster + one still per
+ *    episode, saved to Downloads/Mochi/<Series Title>/ (see
+ *    ImageDownloader). A tap ALWAYS does something visible:
  *    the button turns light blue the moment it is pressed and stays light
  *    blue while the download runs, and a persistent notification shows
  *    the download progress. A tap is never silently swallowed — a locked
  *    button cannot be dragged, so any release on it counts as a tap
  *    (the old `moved` check ate taps whose finger drifted a few pixels).
+ *    A hold fires the image download once; releasing after a hold does
+ *    NOT also start a video download.
  *
  * The button's look: positioning = dashed outline; placed but not
  * confirmed = dashed outline, dimmed; locked = plain, full opacity;
@@ -162,6 +167,8 @@ class OverlayService : Service() {
         private const val NOTIF_CHANNEL = "mochi_overlay"
         private const val NOTIF_ID = 1
         private const val LONG_PRESS_MS = 500L
+        /** Hold time for the image download on the locked button. */
+        private const val LONG_PRESS_IMAGES_MS = 800L
         private const val MOVE_TOLERANCE_PX = 12f
         private const val POLL_MS = 1000L
         private const val BUTTON_SIZE_DP = 51
@@ -190,6 +197,11 @@ class OverlayService : Service() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val longPressRunnable = Runnable { enterEditMode() }
+    /** Long-press (hold) on the LOCKED button: download the series'
+     *  poster + episode stills (v8). Fires once per hold; a normal
+     *  tap (release before this fires) still downloads the video. */
+    private val longPressImagesRunnable = Runnable { fireImageLongPress() }
+    private var imageLongPressFired = false
     private var downX = 0f
     private var downY = 0f
     private var downRawX = 0f
@@ -285,8 +297,9 @@ class OverlayService : Service() {
         prefs.edit().putBoolean(KEY_CONFIRMED, true).apply()
         applyButtonState()
         Toast.makeText(this,
-            "Position locked — tap the button to download the video.",
-            Toast.LENGTH_SHORT).show()
+            "Position locked — tap the button to download the video, " +
+                "hold it to download the poster + episode stills.",
+            Toast.LENGTH_LONG).show()
     }
 
     /** Is the button currently the locked, pressable download button? */
@@ -296,6 +309,7 @@ class OverlayService : Service() {
     override fun onDestroy() {
         handler.removeCallbacks(pollRunnable)
         handler.removeCallbacks(longPressRunnable)
+        handler.removeCallbacks(longPressImagesRunnable)
         removeButton()
         super.onDestroy()
     }
@@ -561,6 +575,21 @@ class OverlayService : Service() {
             Toast.LENGTH_SHORT).show()
     }
 
+    /** The locked button was held past LONG_PRESS_IMAGES_MS: download
+     *  the series' poster + episode stills instead of the video.
+     *  Sets the flag so the release does NOT also start a video
+     *  download. The button stays light blue while the images
+     *  download (via OverlayService.notifyDownloadStarted, called by
+     *  ImageDownloader), the same as a video download. */
+    private fun fireImageLongPress() {
+        if (!isConfirmed() || downloading) return
+        imageLongPressFired = true
+        pressTint = false
+        Toast.makeText(this, "Downloading the poster + episode stills…",
+            Toast.LENGTH_SHORT).show()
+        ImageDownloader.onImagesLongPressed(this)
+    }
+
     /** Released after a drag in positioning mode: the spot is recorded and
      *  persisted as PENDING — it is not locked yet. Alex confirms it in
      *  the app; only then does the button become the download button. */
@@ -586,16 +615,23 @@ class OverlayService : Service() {
                 downParamX = lp.x
                 downParamY = lp.y
                 moved = false
+                imageLongPressFired = false
                 handler.removeCallbacks(longPressRunnable)
+                handler.removeCallbacks(longPressImagesRunnable)
                 // Instant press feedback: the button turns light blue the
                 // moment a finger lands on it, so a tap is never silent.
                 if (!editMode && !downloading) {
                     pressTint = true
                     applyButtonState()
                 }
-                // A locked button cannot be dragged: no long-press.
+                // A locked button cannot be dragged: no edit long-press.
+                // Instead, holding it downloads the images (v8).
                 if (!isConfirmed()) {
                     handler.postDelayed(longPressRunnable, LONG_PRESS_MS)
+                } else if (!downloading) {
+                    handler.postDelayed(
+                        longPressImagesRunnable, LONG_PRESS_IMAGES_MS
+                    )
                 }
                 true
             }
@@ -605,6 +641,10 @@ class OverlayService : Service() {
                 if (Math.abs(dx) > MOVE_TOLERANCE_PX || Math.abs(dy) > MOVE_TOLERANCE_PX) {
                     moved = true
                     handler.removeCallbacks(longPressRunnable)
+                    // A real drag is not a hold: cancel the image
+                    // long-press so it cannot fire after the finger
+                    // slides off the button.
+                    handler.removeCallbacks(longPressImagesRunnable)
                 }
                 if (moved && editMode) {
                     lp.x = (downParamX + dx).toInt()
@@ -615,21 +655,31 @@ class OverlayService : Service() {
             }
             MotionEvent.ACTION_UP -> {
                 handler.removeCallbacks(longPressRunnable)
+                handler.removeCallbacks(longPressImagesRunnable)
                 if (editMode) {
                     // Release in positioning mode: place the spot (drag
                     // or tap) — recorded as PENDING, no auto-lock.
                     pressTint = false
                     exitEditModeAndSave()
                 } else if (isConfirmed()) {
-                    // Tap on the LOCKED button = download the video.
-                    //
-                    // NOTE: there is deliberately NO `moved` check here.
-                    // The old code required !moved, which silently
-                    // swallowed any tap whose finger drifted more than
-                    // 12px — the most common way a tap on a small button
-                    // produces nothing at all. A locked button cannot be
-                    // dragged, so any release on it is a tap.
-                    VideoDownloader.onDownloadTapped(this)
+                    // Tap on the LOCKED button = download the video —
+                    // UNLESS the hold already fired the image download,
+                    // in which case the release does nothing (no video
+                    // on top of the images).
+                    if (imageLongPressFired) {
+                        imageLongPressFired = false
+                        pressTint = false
+                        applyButtonState()
+                    } else {
+                        // NOTE: there is deliberately NO `moved` check
+                        // here. The old code required !moved, which
+                        // silently swallowed any tap whose finger drifted
+                        // more than 12px — the most common way a tap on
+                        // a small button produces nothing at all. A
+                        // locked button cannot be dragged, so any
+                        // release on it is a tap.
+                        VideoDownloader.onDownloadTapped(this)
+                    }
                 } else {
                     // Placed but not confirmed yet: not a download
                     // button. Point Alex at the confirm step.
@@ -644,6 +694,8 @@ class OverlayService : Service() {
             }
             MotionEvent.ACTION_CANCEL -> {
                 handler.removeCallbacks(longPressRunnable)
+                handler.removeCallbacks(longPressImagesRunnable)
+                imageLongPressFired = false
                 pressTint = false
                 applyButtonState()
                 true

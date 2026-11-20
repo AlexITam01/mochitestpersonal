@@ -80,11 +80,13 @@ class MainActivity : Activity() {
                 "1. Long-press the floating button in Mochi and drag it " +
                     "where you want it. Release to place it (it stays dimmed).\n" +
                     "2. Come back here and press \"Lock position\" — the button " +
-                    "becomes fixed and tappable: tap it in Mochi to download.\n" +
-                    "3. To move it later, press \"Move button\", drag it to a " +
-                    "new spot, and lock it again here.\n" +
-                    "A tap opens Mochi's Share menu to get the video link (or " +
-                    "uses Mochi's own Download). See README for the limits.",
+                    "becomes fixed and tappable.\n" +
+                    "3. Tap it in Mochi to download the video playing.\n" +
+                    "4. HOLD it (~1 second) to download the images instead: " +
+                    "the series poster + one still per episode, saved to " +
+                    "Downloads/Mochi/<Series Title>/.\n" +
+                    "To move it later, press \"Move button\", drag it to a " +
+                    "new spot, and lock it again here.",
                 Toast.LENGTH_LONG).show()
         }
     }
